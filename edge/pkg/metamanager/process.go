@@ -467,6 +467,7 @@ func (m *metaManager) processQuery(message model.Message) {
 	} else {
 		resp := message.NewRespByMessage(&message, *metas)
 		klog.Infof("query meta successful, resType: %s, resID: %s, resp: %s", resType, resID, resp.String())
+		klog.Infof("processQuery metas: %+v", *metas)
 		resp.SetRoute(modules.MetaManagerModuleName, resp.GetGroup())
 		sendToEdged(resp, message.IsSync())
 	}
