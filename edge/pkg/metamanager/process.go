@@ -15,8 +15,8 @@ import (
 	cloudmodules "github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	edgecontrollerConstants "github.com/kubeedge/kubeedge/cloud/pkg/edgecontroller/constants"
 	"github.com/kubeedge/kubeedge/common/constants"
-	edgeCommonMessage "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
+	edgeCommonMessage "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	metaManagerConfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
@@ -157,16 +157,16 @@ func msgDebugInfo(message *model.Message) string {
 
 func parseLabels(labels map[string]string) (string, string) {
 	if labels == nil || len(labels) == 0 {
-			return "", ""
+		return "", ""
 	}
 	appName, domain := "", ""
 	configType := labels[edgecontrollerConstants.ConfigType]
 	if configType == constants.Native {
 		if val, ok := labels[edgecontrollerConstants.AppName]; ok {
-				appName = val
+			appName = val
 		}
 		if val, ok := labels[edgecontrollerConstants.Domain]; ok {
-				domain = val
+			domain = val
 		}
 	}
 	return appName, domain
@@ -466,6 +466,7 @@ func (m *metaManager) processQuery(message model.Message) {
 		feedbackError(fmt.Errorf("failed to query meta in DB: %s", err), message)
 	} else {
 		resp := message.NewRespByMessage(&message, *metas)
+		klog.Infof("query meta successful, resType: %s, resID: %s, resp: %s", resType, resID, resp.String())
 		resp.SetRoute(modules.MetaManagerModuleName, resp.GetGroup())
 		sendToEdged(resp, message.IsSync())
 	}
