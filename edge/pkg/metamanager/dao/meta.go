@@ -9,7 +9,7 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
 )
 
-//constant metatable name reference
+// constant metatable name reference
 const (
 	MetaTableName = "meta"
 )
@@ -59,7 +59,7 @@ func UpdateMeta(meta *Meta) error {
 
 // InsertOrUpdate insert or update meta
 func InsertOrUpdate(meta *Meta) error {
-	 _, err := dbm.DBAccess.Raw("INSERT OR REPLACE INTO meta (key, type, appname, domain, value) VALUES (?,?,?,?,?)", meta.Key, meta.Type, meta.AppName, meta.Domain, meta.Value).Exec() // will update all field
+	_, err := dbm.DBAccess.Raw("INSERT OR REPLACE INTO meta (key, type, appname, domain, value) VALUES (?,?,?,?,?)", meta.Key, meta.Type, meta.AppName, meta.Domain, meta.Value).Exec() // will update all field
 	klog.V(4).Infof("Update result %v", err)
 	return err
 }
@@ -81,6 +81,7 @@ func UpdateMetaFields(key string, cols map[string]interface{}) error {
 // QueryMeta return only meta's value, if no error, Meta not null
 func QueryMeta(key string, condition string) (*[]string, error) {
 	meta := new([]Meta)
+	klog.Infof("QueryMeta key: %s, condition: %s", key, condition)
 	_, err := dbm.DBAccess.QueryTable(MetaTableName).Filter(key, condition).All(meta)
 	if err != nil {
 		return nil, err
@@ -88,12 +89,13 @@ func QueryMeta(key string, condition string) (*[]string, error) {
 
 	var result []string
 	for _, v := range *meta {
+		klog.Infof("QueryMeta key: %s", v.Key)
 		result = append(result, v.Value)
 	}
 	return &result, nil
 }
 
-//QueryMeta return only meta's value by many conditions, if no error, Meta not null
+// QueryMeta return only meta's value by many conditions, if no error, Meta not null
 func QueryMetasByGroupCond(conditions map[string]string) (*[]string, error) {
 	meta := new([]Meta)
 	conds := orm.NewCondition()

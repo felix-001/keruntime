@@ -206,6 +206,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 			continue
 		}
 
+		klog.Infof("syncPod resource: %s", result.GetResource())
 		_, resType, resID, err := util.ParseResourceEdge(result.GetResource(), result.GetOperation())
 		if err != nil {
 			klog.Errorf("failed to parse the Resource: %v", err)
