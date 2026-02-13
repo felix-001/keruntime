@@ -221,6 +221,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 
 		switch resType {
 		case model.ResourceTypePod:
+			klog.Infof("pod operation type: %s, content: %s, resID: %s, source: %s", op, string(content), resID, result.GetSource())
 			if op == model.ResponseOperation && resID == "" && result.GetSource() == modules.MetaManagerModuleName {
 				err := e.handlePodListFromMetaManager(content, rawUpdateChan)
 				if err != nil {
