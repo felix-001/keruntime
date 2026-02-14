@@ -240,6 +240,8 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 			if existing, found := oldPods[ref.UID]; found {
 				pods[ref.UID] = existing
 				needUpdate, needReconcile, needGracefulDelete := checkAndUpdatePod(existing, ref)
+				klog.Infof("podStorage.merge Processing pod %s/%s: needUpdate=%v, needReconcile=%v, needGracefulDelete=%v",
+					existing.Namespace, existing.Name, needUpdate, needReconcile, needGracefulDelete)
 				if needUpdate {
 					updatePods = append(updatePods, existing)
 				} else if needReconcile {
@@ -248,6 +250,8 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 					deletePods = append(deletePods, existing)
 				}
 				continue
+			} else {
+				klog.Infof("podStorage.merge Adding new pod %s/%s from source %s", ref.Namespace, ref.Name, source)
 			}
 			recordFirstSeenTime(ref)
 			pods[ref.UID] = ref
@@ -256,19 +260,24 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 	}
 
 	update := change.(kubetypes.PodUpdate)
+	klog.Infof("podStorage.merge Processing pod update from source %s, op: %d", source, update.Op)
+	for _, pod := range update.Pods {
+		klog.Infof("podStorage.merge Processing pod %s/%s, op: %d", pod.Namespace, pod.Name, update.Op)
+	}
+
 	switch update.Op {
 	case kubetypes.ADD, kubetypes.UPDATE, kubetypes.DELETE:
 		if update.Op == kubetypes.ADD {
-			klog.V(4).InfoS("Adding new pods from source", "source", source, "pods", klog.KObjs(update.Pods))
+			klog.V(0).InfoS("Adding new pods from source", "source", source, "pods", klog.KObjs(update.Pods))
 		} else if update.Op == kubetypes.DELETE {
-			klog.V(4).InfoS("Gracefully deleting pods from source", "source", source, "pods", klog.KObjs(update.Pods))
+			klog.V(0).InfoS("Gracefully deleting pods from source", "source", source, "pods", klog.KObjs(update.Pods))
 		} else {
-			klog.V(4).InfoS("Updating pods from source", "source", source, "pods", klog.KObjs(update.Pods))
+			klog.V(0).InfoS("Updating pods from source", "source", source, "pods", klog.KObjs(update.Pods))
 		}
 		updatePodsFunc(update.Pods, pods, pods)
 
 	case kubetypes.REMOVE:
-		klog.V(4).InfoS("Removing pods from source", "source", source, "pods", klog.KObjs(update.Pods))
+		klog.V(0).InfoS("Removing pods from source", "source", source, "pods", klog.KObjs(update.Pods))
 		for _, value := range update.Pods {
 			if existing, found := pods[value.UID]; found {
 				// this is a delete
@@ -280,7 +289,7 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 		}
 
 	case kubetypes.SET:
-		klog.V(4).InfoS("Setting pods for source", "source", source)
+		klog.V(0).InfoS("Setting pods for source", "source", source)
 		s.markSourceSet(source)
 		// Clear the old map entries by just creating a new map
 		oldPods := pods
@@ -416,6 +425,7 @@ func podsDifferSemantically(existing, ref *v1.Pod) bool {
 //     Now, needUpdate, needGracefulDelete and needReconcile should never be both true
 func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGracefulDelete bool) {
 
+	klog.Infof("checkAndUpdatePod, process pod: %s", ref.Name)
 	// 1. this is a reconcile
 	// TODO: it would be better to update the whole object and only preserve certain things
 	//       like the source annotation or the UID (to ensure safety)
@@ -423,12 +433,15 @@ func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGr
 		// this is not an update
 		// Only check reconcile when it is not an update, because if the pod is going to
 		// be updated, an extra reconcile is unnecessary
+		klog.Infof("checkAndUpdatePod, process pod: %s, !podsDifferSemantically", ref.Name)
 		if !reflect.DeepEqual(existing.Status, ref.Status) {
 			// Pod with changed pod status needs reconcile, because kubelet should
 			// be the source of truth of pod status.
 			existing.Status = ref.Status
+			klog.Infof("checkAndUpdatePod, process pod: %s, reflect.DeepEqual", ref.Name)
 			needReconcile = true
 		}
+		klog.Infof("checkAndUpdatePod, process pod: %s, not reflect.DeepEqual", ref.Name)
 		return
 	}
 
@@ -445,11 +458,14 @@ func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGr
 
 	// 2. this is an graceful delete
 	if ref.DeletionTimestamp != nil {
+		klog.Infof("checkAndUpdatePod, process pod: %s, ref.DeletionTimestamp != nil", ref.Name)
 		needGracefulDelete = true
 	} else {
 		// 3. this is an update
+		klog.Infof("checkAndUpdatePod, process pod: %s, ref.DeletionTimestamp == nil", ref.Name)
 		needUpdate = true
 	}
+	klog.Infof("checkAndUpdatePod, process pod: %s, end", ref.Name)
 
 	return
 }
