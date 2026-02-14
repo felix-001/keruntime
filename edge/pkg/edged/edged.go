@@ -349,6 +349,7 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 			klog.Infof("handlePodListFromMetaManager, pod name: %s, message: %s, pod status: %s, reason: %s",
 				pod.Name, pod.Status.Message, pod.Status.Phase, pod.Status.Reason)
 			if pod.DeletionTimestamp == nil {
+				klog.Infof("Pod %s is added to pod list", pod.Name)
 				pods = append(pods, &pod)
 			} else {
 				podsUpdate = append(podsUpdate, &pod)
