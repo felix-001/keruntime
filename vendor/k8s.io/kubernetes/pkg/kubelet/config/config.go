@@ -22,7 +22,7 @@ import (
 	"reflect"
 	"sync"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
@@ -164,6 +164,16 @@ func (s *podStorage) Merge(source string, change interface{}) error {
 
 	seenBefore := s.sourcesSeen.Has(source)
 	adds, updates, deletes, removes, reconciles := s.merge(source, change)
+
+	traverse := func(update *kubetypes.PodUpdate) {
+		for _, pod := range update.Pods {
+			klog.Infof("podStorage.Merge Processing pod %s/%s, op: %d", pod.Namespace, pod.Name, update.Op)
+		}
+	}
+	for _, update := range []*kubetypes.PodUpdate{adds, updates, deletes, removes, reconciles} {
+		traverse(update)
+	}
+
 	firstSet := !seenBefore && s.sourcesSeen.Has(source)
 
 	// deliver update notifications
@@ -399,11 +409,11 @@ func podsDifferSemantically(existing, ref *v1.Pod) bool {
 }
 
 // checkAndUpdatePod updates existing, and:
-//   * if ref makes a meaningful change, returns needUpdate=true
-//   * if ref makes a meaningful change, and this change is graceful deletion, returns needGracefulDelete=true
-//   * if ref makes no meaningful change, but changes the pod status, returns needReconcile=true
-//   * else return all false
-//   Now, needUpdate, needGracefulDelete and needReconcile should never be both true
+//   - if ref makes a meaningful change, returns needUpdate=true
+//   - if ref makes a meaningful change, and this change is graceful deletion, returns needGracefulDelete=true
+//   - if ref makes no meaningful change, but changes the pod status, returns needReconcile=true
+//   - else return all false
+//     Now, needUpdate, needGracefulDelete and needReconcile should never be both true
 func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGracefulDelete bool) {
 
 	// 1. this is a reconcile
