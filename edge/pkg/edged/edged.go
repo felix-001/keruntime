@@ -224,6 +224,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 		case model.ResourceTypePod:
 			klog.Infof("pod operation type: %s, content: %s, resID: %s, source: %s", op, string(content), resID, result.GetSource())
 			if op == model.ResponseOperation && resID == "" && result.GetSource() == modules.MetaManagerModuleName {
+				klog.Infof("handling pod list from meta manager")
 				err := e.handlePodListFromMetaManager(content, rawUpdateChan)
 				if err != nil {
 					klog.Errorf("handle podList failed: %v", err)
@@ -345,11 +346,15 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 
 		// if edge-core stop or panic when pod is deleting, pod need add into podDeletionQueue after edge-core restart.
 		if filterPodByNodeName(&pod, e.nodeName) {
+			klog.Info("handlePodListFromMetaManager, pod name: %s, message: %s, pod status: %s, reason: %s",
+				pod.Name, pod.Status.Message, pod.Status.Phase, pod.Status.Reason)
 			if pod.DeletionTimestamp == nil {
 				pods = append(pods, &pod)
 			} else {
 				podsUpdate = append(podsUpdate, &pod)
 			}
+		} else {
+			klog.Infof("Pod %s not for this node %s", pod.Name, e.nodeName)
 		}
 	}
 
