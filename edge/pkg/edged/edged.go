@@ -346,7 +346,7 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 
 		// if edge-core stop or panic when pod is deleting, pod need add into podDeletionQueue after edge-core restart.
 		if filterPodByNodeName(&pod, e.nodeName) {
-			klog.Info("handlePodListFromMetaManager, pod name: %s, message: %s, pod status: %s, reason: %s",
+			klog.Infof("handlePodListFromMetaManager, pod name: %s, message: %s, pod status: %s, reason: %s",
 				pod.Name, pod.Status.Message, pod.Status.Phase, pod.Status.Reason)
 			if pod.DeletionTimestamp == nil {
 				pods = append(pods, &pod)
