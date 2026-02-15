@@ -276,6 +276,8 @@ func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interfac
 	if err != nil {
 		return err
 	}
+	klog.Infof("Handling pod operation: %s for pod: %s in namespace: %s",
+		op, pod.Name, pod.Namespace)
 
 	// When the edge node is offline and the pod in the node is deleted forcefully,
 	// and then we make the node online, We do not have the pod full information
@@ -374,6 +376,8 @@ func (e *edged) handlePodListFromEdgeController(content []byte, updatesChan chan
 	}
 
 	for _, pod := range podLists {
+		klog.Infof("handlePodListFromEdgeController, pod name: %s, node name: %s",
+			pod.Name, e.nodeName)
 		if filterPodByNodeName(&pod, e.nodeName) {
 			pods = append(pods, &pod)
 		}
