@@ -3,11 +3,15 @@ package metamanager
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/klog/v2"
 
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
@@ -15,13 +19,16 @@ import (
 	cloudmodules "github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	edgecontrollerConstants "github.com/kubeedge/kubeedge/cloud/pkg/edgecontroller/constants"
 	"github.com/kubeedge/kubeedge/common/constants"
-	edgeCommonMessage "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
+	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
+	edgeCommonMessage "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	metaManagerConfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
+	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/watchhook"
 )
 
 // Constants to check metamanager processes
@@ -30,6 +37,13 @@ const (
 	GroupResource        = "resource"
 	CloudControllerModel = "edgecontroller"
 	errNotConnected      = "not connected"
+)
+
+type PodDeleteSnapshot []string
+
+const (
+	podSnapshotQueryRetries = 3
+	podSnapshotQueryBackoff = time.Second
 )
 
 func feedbackError(err error, request model.Message) {
@@ -157,16 +171,16 @@ func msgDebugInfo(message *model.Message) string {
 
 func parseLabels(labels map[string]string) (string, string) {
 	if labels == nil || len(labels) == 0 {
-			return "", ""
+		return "", ""
 	}
 	appName, domain := "", ""
 	configType := labels[edgecontrollerConstants.ConfigType]
 	if configType == constants.Native {
 		if val, ok := labels[edgecontrollerConstants.AppName]; ok {
-				appName = val
+			appName = val
 		}
 		if val, ok := labels[edgecontrollerConstants.Domain]; ok {
-				domain = val
+			domain = val
 		}
 	}
 	return appName, domain
@@ -238,7 +252,7 @@ func (m *metaManager) handleMessage(message *model.Message) error {
 			err := processDeletePodDB(*message)
 			if err != nil {
 				klog.Errorf("delete pod meta failed, message %s, err: %v", msgDebugInfo(message), err)
-				return fmt.Errorf("failed to delete pod meta to DB: %s", err)
+				return fmt.Errorf("failed to delete pod meta to DB: %w", err)
 			}
 		} else {
 			err := dao.DeleteMetaByKey(resKey)
@@ -322,12 +336,18 @@ func (m *metaManager) processUpdate(message model.Message) {
 	}
 }
 
-func (m *metaManager) processPatch(message model.Message) {
+func (m *metaManager) processPatch(message model.Message) <-chan struct{} {
 	if err := m.handleMessage(&message); err != nil {
 		feedbackError(err, message)
-		return
+		return nil
+	}
+	_, resType, _, _, _ := parseResource(&message)
+	if resType == model.ResourceTypePodPatch && message.GetSource() == modules.EdgedModuleName {
+		klog.Infof("Processing pod status PATCH through processRemote, req[%s]", msgDebugInfo(&message))
+		return m.processRemote(message)
 	}
 	sendToCloud(&message)
+	return nil
 }
 
 func (m *metaManager) processResponse(message model.Message) {
@@ -345,16 +365,32 @@ func (m *metaManager) processResponse(message model.Message) {
 }
 
 func (m *metaManager) processDelete(message model.Message) {
-	imitator.DefaultV2Client.Inject(message)
 	_, resType, _, _, _ := parseResource(&message)
 	if resType == model.ResourceTypePod && message.GetSource() == modules.EdgedModuleName {
 		// if pod is deleted in K8s, then a new delete message will be sent to edge
 		sendToCloud(&message)
 		return
 	}
+	if resType != model.ResourceTypePod {
+		imitator.DefaultV2Client.Inject(message)
+	}
 
-	if err := m.handleMessage(&message); err != nil {
-		feedbackError(err, message)
+	localCleanup := resType == model.ResourceTypePod && message.GetSource() == m.Name() && message.IsSync()
+	err := m.handleMessage(&message)
+	edgedMessage := message
+	if err == nil && resType == model.ResourceTypePod && message.GetSource() != cloudmodules.PolicyControllerModuleName {
+		err = attachPodDeleteSnapshot(&edgedMessage)
+	}
+	if err != nil {
+		if localCleanup {
+			errResponse := model.NewMessage(message.GetID()).
+				SetResourceOperation(message.GetResource(), model.ResponseErrorOperation).
+				SetType(message.GetType()).
+				FillBody(err.Error())
+			beehiveContext.SendResp(*errResponse)
+		} else {
+			feedbackError(err, message)
+		}
 		return
 	}
 	msgSource := message.GetSource()
@@ -365,13 +401,49 @@ func (m *metaManager) processDelete(message model.Message) {
 
 	if msgSource != cloudmodules.PolicyControllerModuleName {
 		// Notify edged
-		sendToEdged(&message, false)
+		if localCleanup {
+			beehiveContext.Send(modules.EdgedModuleName, edgedMessage)
+			return
+		}
+		sendToEdged(&edgedMessage, false)
 	}
 	resp := message.NewRespByMessage(&message, OK)
 	sendToCloud(resp)
 }
 
+func attachPodDeleteSnapshot(message *model.Message) error {
+	content, err := message.GetContentData()
+	if err != nil {
+		return err
+	}
+	var pod corev1.Pod
+	if err := json.Unmarshal(content, &pod); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(pod.Spec, corev1.PodSpec{}) {
+		return nil
+	}
+	metas, err := queryMetasByType(model.ResourceTypePod)
+	if err != nil {
+		return fmt.Errorf("query pod snapshot after delete: %w", err)
+	}
+	message.SetRoute(modules.MetaManagerModuleName, message.GetGroup())
+	message.FillBody(PodDeleteSnapshot(*metas))
+	return nil
+}
+
 func processDeletePodDB(message model.Message) error {
+	var msgPod corev1.Pod
+	msgContent, err := message.GetContentData()
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(msgContent, &msgPod); err != nil {
+		return err
+	}
+	if msgPod.UID == "" {
+		return fmt.Errorf("pod delete requires metadata.uid")
+	}
 	podDBList, err := dao.QueryMeta("key", message.GetResource())
 	if err != nil {
 		return err
@@ -380,34 +452,22 @@ func processDeletePodDB(message model.Message) error {
 	podList := *podDBList
 	if len(podList) == 0 {
 		klog.Infof("no pod with key %s key in DB", message.GetResource())
-		return nil
+	} else {
+		var podDB corev1.Pod
+		if err := json.Unmarshal([]byte(podList[0]), &podDB); err != nil {
+			return err
+		}
+		if podDB.UID != msgPod.UID {
+			klog.Warningf("Skipping pod metadata deletion because UID does not match, resource: %s, storedPodUID: %s, messagePodUID: %s, messageID: %s",
+				message.GetResource(), podDB.UID, msgPod.UID, message.GetID())
+			// The V1 record belongs to a newer pod, so keep it, but meta_v2 may
+			// still hold a record of the deleted pod from an earlier Inject that
+			// failed to be replaced. Clean that up independently; deletePodV2
+			// only removes records whose UID matches the deleted pod.
+			return deletePodV2(msgPod)
+		}
 	}
-
-	var podDB corev1.Pod
-	err = json.Unmarshal([]byte(podList[0]), &podDB)
-	if err != nil {
-		return err
-	}
-
-	var msgPod corev1.Pod
-	msgContent, err := message.GetContentData()
-	if err != nil {
-		return err
-	}
-
-	err = json.Unmarshal(msgContent, &msgPod)
-	if err != nil {
-		return err
-	}
-
-	if podDB.UID != msgPod.UID {
-		klog.Warningf("Skipping pod metadata deletion because UID does not match, resource: %s, storedPodUID: %s, messagePodUID: %s, messageID: %s",
-			message.GetResource(), podDB.UID, msgPod.UID, message.GetID())
-		return nil
-	}
-
-	err = dao.DeleteMetaByKey(message.GetResource())
-	if err != nil {
+	if err := deletePodV2(msgPod); err != nil {
 		return err
 	}
 
@@ -418,13 +478,52 @@ func processDeletePodDB(message model.Message) error {
 	if err != nil {
 		return err
 	}
+	if err := dao.DeleteMetaByKey(message.GetResource()); err != nil {
+		return err
+	}
 	klog.InfoS("Deleted pod metadata before notifying edged",
 		"resource", message.GetResource(),
-		"pod", klog.KObj(&podDB),
-		"podUID", podDB.UID,
+		"pod", klog.KObj(&msgPod),
+		"podUID", msgPod.UID,
 		"messageID", message.GetID())
 
 	return nil
+}
+
+func deletePodV2(pod corev1.Pod) error {
+	key := fmt.Sprintf("/core/v1/pods/%s/%s", pod.Namespace, pod.Name)
+retry:
+	for {
+		var records []v2.MetaV2
+		if _, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter("key", key).All(&records); err != nil {
+			return err
+		}
+		for _, record := range records {
+			var stored corev1.Pod
+			if err := json.Unmarshal([]byte(record.Value), &stored); err != nil {
+				return err
+			}
+			if stored.UID != pod.UID {
+				continue
+			}
+			deleted, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter("key", key).Filter("value", record.Value).Delete()
+			if err != nil {
+				return err
+			}
+			if deleted == 0 {
+				continue retry
+			}
+			object := &unstructured.Unstructured{}
+			if err := json.Unmarshal([]byte(record.Value), &object.Object); err != nil {
+				return err
+			}
+			if pod.ResourceVersion != "" {
+				object.SetResourceVersion(pod.ResourceVersion)
+			}
+			watchhook.TriggerPodDeletion(watch.Event{Type: watch.Deleted, Object: object})
+		}
+		return nil
+	}
 }
 
 func (m *metaManager) processQuery(message model.Message) {
@@ -463,7 +562,7 @@ func (m *metaManager) processQuery(message model.Message) {
 
 	if resID == "" {
 		// Get specific type resources
-		metas, err = dao.QueryMeta("type", resType)
+		metas, err = queryMetasByType(resType)
 	} else {
 		metas, err = dao.QueryMeta("key", resKey)
 	}
@@ -477,8 +576,21 @@ func (m *metaManager) processQuery(message model.Message) {
 	}
 }
 
-func (m *metaManager) processRemote(message model.Message) {
+func queryMetasByType(resType string) (*[]string, error) {
+	metas, err := dao.QueryMeta("type", resType)
+	for attempt := 1; err != nil && resType == model.ResourceTypePod && attempt < podSnapshotQueryRetries; attempt++ {
+		klog.Warningf("query pod snapshot failed, retrying in %s, attempt: %d/%d, err: %v",
+			podSnapshotQueryBackoff, attempt, podSnapshotQueryRetries, err)
+		time.Sleep(podSnapshotQueryBackoff)
+		metas, err = dao.QueryMeta("type", resType)
+	}
+	return metas, err
+}
+
+func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		// TODO: retry
 		originalID := message.GetID()
 		message.UpdateID()
@@ -492,6 +604,21 @@ func (m *metaManager) processRemote(message model.Message) {
 			return
 		}
 		klog.V(4).Infof("process remote: req[%s], resp[%s]", msgDebugInfo(&message), msgDebugInfo(&resp))
+		if _, ok := resp.GetContent().([]byte); ok {
+			content, err := resp.GetContentData()
+			if err != nil {
+				klog.Errorf("decode remote response failed, req[%s], err: %v", msgDebugInfo(&message), err)
+				feedbackError(err, message)
+				return
+			}
+			var decoded interface{}
+			if err := json.Unmarshal(content, &decoded); err != nil {
+				klog.Errorf("unmarshal remote response failed, req[%s], err: %v", msgDebugInfo(&message), err)
+				feedbackError(err, message)
+				return
+			}
+			resp.Content = decoded
+		}
 		content, ok := resp.GetContent().(string)
 		if ok && content == constants.MessageSuccessfulContent {
 			klog.V(4).Infof("process remote successfully")
@@ -507,11 +634,25 @@ func (m *metaManager) processRemote(message model.Message) {
 		mapContent, ok := resp.GetContent().(map[string]interface{})
 		if ok && isObjectResp(mapContent) {
 			if mapContent["Err"] != nil {
+				if isPodPatchNotFound(message, mapContent["Err"]) {
+					klog.Infof("Pod status PATCH returned NotFound, starting local cleanup, req[%s]", msgDebugInfo(&message))
+					if err := m.deleteMissingPod(message); err != nil {
+						klog.Errorf("delete missing pod failed, req[%s], err: %v", msgDebugInfo(&message), err)
+						resp.FillBody(client.PodResp{Err: *apierrors.NewInternalError(err)})
+						feedbackResponse(&message, originalID, &resp)
+						return
+					}
+				}
 				klog.V(4).Infof("process remote objResp err: %v", mapContent["Err"])
 				feedbackResponse(&message, originalID, &resp)
 				return
 			}
 			klog.V(4).Infof("process remote objResp: %+v", mapContent["Object"])
+			_, resType, _, _, _ := parseResource(&message)
+			if resType == model.ResourceTypePodPatch || resType == model.ResourceTypeLease {
+				feedbackResponse(&message, originalID, &resp)
+				return
+			}
 			resp.Content = mapContent["Object"]
 		}
 		if err := m.handleMessage(&resp); err != nil {
@@ -520,6 +661,58 @@ func (m *metaManager) processRemote(message model.Message) {
 		}
 		feedbackResponse(&message, originalID, &resp)
 	}()
+	return done
+}
+
+func isPodPatchNotFound(message model.Message, errContent interface{}) bool {
+	_, resourceType, _, _, _ := parseResource(&message)
+	if resourceType != model.ResourceTypePodPatch {
+		return false
+	}
+	errMap, ok := errContent.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	status, ok := errMap["ErrStatus"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	code, ok := status["code"].(float64)
+	return ok && code == 404
+}
+
+func (m *metaManager) deleteMissingPod(patchMessage model.Message) error {
+	patch, err := patchMessage.GetContentData()
+	if err != nil {
+		return err
+	}
+	var pod corev1.Pod
+	if err := json.Unmarshal(patch, &pod); err != nil {
+		return err
+	}
+	if pod.UID == "" {
+		return fmt.Errorf("pod status patch requires metadata.uid")
+	}
+	parts := strings.Split(patchMessage.GetResource(), constants.ResourceSep)
+	if len(parts) != 3 || parts[0] == "" || parts[1] != model.ResourceTypePodPatch || parts[2] == "" {
+		return fmt.Errorf("invalid pod patch resource: %s", patchMessage.GetResource())
+	}
+	pod.Namespace, pod.Name = parts[0], parts[2]
+	resource := strings.Replace(patchMessage.GetResource(),
+		constants.ResourceSep+model.ResourceTypePodPatch+constants.ResourceSep,
+		constants.ResourceSep+model.ResourceTypePod+constants.ResourceSep, 1)
+	deleteMessage := model.NewMessage("").
+		BuildRouter(m.Name(), modules.MetaGroup, resource, model.DeleteOperation).
+		FillBody(&pod)
+	resp, err := beehiveContext.SendSync(m.Name(), *deleteMessage,
+		time.Duration(metaManagerConfig.Config.RemoteQueryTimeout)*time.Second)
+	if err != nil {
+		return fmt.Errorf("wait for local pod cleanup: %w", err)
+	}
+	if resp.GetContent() != OK {
+		return fmt.Errorf("local pod cleanup failed: %v", resp.GetContent())
+	}
+	return nil
 }
 
 func isObjectResp(data map[string]interface{}) bool {

@@ -35,6 +35,8 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/protobuf/jsonpb"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/klog/v2"
@@ -51,6 +53,7 @@ import (
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/common/constants"
+	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/util"
 	edgedconfig "github.com/kubeedge/kubeedge/edge/pkg/edged/config"
@@ -193,6 +196,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 	beehiveContext.Send(modules.MetaManagerModuleName, *info)
 	// rawUpdateChan receives the update events from metamanager or edgecontroller
 	rawUpdateChan := podCfg.Channel(beehiveContext.GetContext(), kubelettypes.ApiserverSource)
+	restoredPodVerificationStarted := false
 	for {
 		select {
 		case <-beehiveContext.Done():
@@ -228,6 +232,10 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 					continue
 				}
 				podCfg.SetInitPodReady(true)
+				if !restoredPodVerificationStarted {
+					restoredPodVerificationStarted = true
+					go e.verifyRestoredPods(content)
+				}
 			} else if op == model.ResponseOperation && resID == "" && result.GetSource() == metamanager.CloudControllerModel {
 				err := e.handlePodListFromEdgeController(content, rawUpdateChan)
 				if err != nil {
@@ -236,10 +244,19 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 				}
 				podCfg.SetInitPodReady(true)
 			} else {
-				err = e.handlePod(op, content, rawUpdateChan)
+				_, isDeleteSnapshot := result.GetContent().(metamanager.PodDeleteSnapshot)
+				if op == model.DeleteOperation && result.GetSource() == modules.MetaManagerModuleName && isDeleteSnapshot {
+					klog.InfoS("Received pod delete snapshot from MetaManager", "resource", result.GetResource(), "messageID", result.GetID())
+					err = e.handlePodListFromMetaManager(content, rawUpdateChan)
+				} else {
+					err = e.handlePod(op, content, rawUpdateChan)
+				}
 				if err != nil {
 					klog.Errorf("handle pod failed: %v", err)
 					continue
+				}
+				if op == model.DeleteOperation && result.IsSync() {
+					beehiveContext.SendResp(*result.NewRespByMessage(&result, "OK"))
 				}
 			}
 		case constants.CSIResourceTypeVolume:
@@ -274,21 +291,8 @@ func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interfac
 		return err
 	}
 
-	// When the edge node is offline and the pod in the node is deleted forcefully,
-	// and then we make the node online, We do not have the pod full information
-	// because the pod is deleted from the kube apiServer, then the syncController
-	// will send a message with the pod name, namespace and UID, so we can not filter
-	// pod according to the node name. So in this scenario, we query metadata from edge
-	// database and use func handlePodListFromMetaManager to sync with Kubelet.
 	if op == model.DeleteOperation && reflect.DeepEqual(pod.Spec, v1.PodSpec{}) {
-		klog.InfoS("Received metadata-only pod delete, refreshing pod snapshot from MetaManager",
-			"node", e.nodeName,
-			"pod", klog.KObj(&pod),
-			"podUID", pod.UID)
-		info := model.NewMessage("").BuildRouter(e.Name(), e.Group(), e.namespace+"/"+model.ResourceTypePod,
-			model.QueryOperation)
-		beehiveContext.Send(modules.MetaManagerModuleName, *info)
-		return nil
+		return fmt.Errorf("metadata-only pod delete requires a pod snapshot")
 	}
 
 	var pods []*v1.Pod
@@ -349,7 +353,7 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 		}
 	}
 
-	klog.InfoS("Received pod list from MetaManager before kubelet SET",
+	klog.InfoS("handlePodListFromMetaManager, Received pod list from MetaManager before kubelet SET",
 		"node", e.nodeName,
 		"databasePodCount", len(lists),
 		"setPodCount", len(pods),
@@ -359,6 +363,62 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 	updatesChan <- *updates
 
 	return nil
+}
+
+func (e *edged) verifyRestoredPods(content []byte) {
+	var lists []string
+	if err := json.Unmarshal(content, &lists); err != nil {
+		klog.Errorf("Failed to decode restored pods for verification: %v", err)
+		return
+	}
+	var pending []v1.Pod
+	for _, data := range lists {
+		var pod v1.Pod
+		if err := json.Unmarshal([]byte(data), &pod); err != nil {
+			klog.Errorf("Failed to decode restored pod for verification: %v", err)
+			continue
+		}
+		if !filterPodByNodeName(&pod, e.nodeName) || pod.UID == "" {
+			continue
+		}
+		pending = append(pending, pod)
+	}
+	client := metaclient.New()
+	stop := beehiveContext.Done()
+	_ = wait.PollImmediateUntil(5*time.Second, func() (bool, error) {
+		remaining := pending[:0]
+		for index := range pending {
+			select {
+			case <-stop:
+				return true, nil
+			default:
+			}
+			if !connect.IsConnected() {
+				remaining = append(remaining, pending[index:]...)
+				break
+			}
+			pod := &pending[index]
+			if !verifyRestoredPod(pod, client.Pods(pod.Namespace).Patch) {
+				remaining = append(remaining, *pod)
+			}
+		}
+		pending = remaining
+		return len(pending) == 0, nil
+	}, stop)
+}
+
+func verifyRestoredPod(pod *v1.Pod, patchPod func(string, []byte) (*v1.Pod, error)) bool {
+	patch, err := json.Marshal(map[string]interface{}{"metadata": map[string]interface{}{"uid": pod.UID}})
+	if err != nil {
+		return false
+	}
+	klog.InfoS("Verifying restored pod with UID-only PATCH", "pod", klog.KObj(pod), "podUID", pod.UID)
+	_, err = patchPod(pod.Name, patch)
+	if err == nil || apierrors.IsNotFound(err) {
+		return true
+	}
+	klog.ErrorS(err, "Restored pod verification failed", "pod", klog.KObj(pod), "podUID", pod.UID)
+	return apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) || apierrors.IsConflict(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err)
 }
 
 func (e *edged) handlePodListFromEdgeController(content []byte, updatesChan chan<- interface{}) (err error) {
