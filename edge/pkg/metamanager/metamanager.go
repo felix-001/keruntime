@@ -1,11 +1,15 @@
 package metamanager
 
 import (
+	"sync"
+	"time"
+
 	"github.com/astaxie/beego/orm"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
+	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	metamanagerconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
@@ -17,15 +21,26 @@ import (
 )
 
 type metaManager struct {
-	enable bool
+	enable             bool
+	syncTransport      func(string, model.Message, time.Duration) (model.Message, error)
+	podDeleteRetry     chan model.Message
+	podDeleteRetryOnce sync.Once
 }
 
 var _ core.Module = (*metaManager)(nil)
 
 func newMetaManager(enable bool) *metaManager {
 	return &metaManager{
-		enable: enable,
+		enable:         enable,
+		podDeleteRetry: make(chan model.Message, 16),
 	}
+}
+
+func (m *metaManager) sendSync(module string, message model.Message, timeout time.Duration) (model.Message, error) {
+	if m.syncTransport != nil {
+		return m.syncTransport(module, message, timeout)
+	}
+	return beehiveContext.SendSync(module, message, timeout)
 }
 
 // Register register metamanager

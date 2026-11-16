@@ -40,6 +40,14 @@ func DeleteHook(id string) error {
 
 // Trigger trigger the corresponding hook to serve watch based on the event passed in
 func Trigger(e watch.Event) {
+	trigger(e, true)
+}
+
+func TriggerPodDeletion(e watch.Event) {
+	trigger(e, false)
+}
+
+func trigger(e watch.Event, checkVersion bool) {
 	key, err := metaserver.KeyFuncObj(e.Object)
 	if err != nil {
 		klog.Errorf("failed to get key, %v", err)
@@ -58,7 +66,7 @@ func Trigger(e watch.Event) {
 		if hook.GetName() != "" {
 			compName = hook.GetName() == name
 		}
-		if hook.GetResourceVersion() != 0 {
+		if checkVersion && hook.GetResourceVersion() != 0 {
 			accessor, err := meta.Accessor(e.Object)
 			if err != nil {
 				klog.Errorf("failed to get accessor, %v", err)
