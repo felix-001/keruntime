@@ -2,13 +2,54 @@ package edged
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
+
+func TestVerifyRestoredPod(t *testing.T) {
+	resource := schema.GroupResource{Resource: "pods"}
+	for _, test := range []struct {
+		name     string
+		err      error
+		complete bool
+	}{
+		{"success", nil, true},
+		{"missing", apierrors.NewNotFound(resource, "old"), true},
+		{"forbidden", apierrors.NewForbidden(resource, "old", fmt.Errorf("denied")), false},
+		{"unauthorized", apierrors.NewUnauthorized("denied"), false},
+		{"conflict", apierrors.NewConflict(resource, "old", fmt.Errorf("conflict")), false},
+		{"bad request", apierrors.NewBadRequest("invalid"), false},
+		{"invalid", apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "old", nil), false},
+		{"uid mismatch", apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "old", field.ErrorList{field.Invalid(field.NewPath("metadata", "uid"), "old", "uid changed")}), true},
+		{"unexpected 404", apierrors.NewGenericServerResponse(404, "PATCH", resource, "old", "proxy", 0, true), false},
+		{"server error", apierrors.NewInternalError(fmt.Errorf("unavailable")), false},
+		{"timeout", apierrors.NewTimeoutError("timeout", 1), false},
+		{"connection error", fmt.Errorf("disconnected"), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: "default", UID: "old-uid"}}
+			called := false
+			complete := verifyRestoredPod(pod, func(name string, patch []byte) (*v1.Pod, error) {
+				called = true
+				if name != "old" || string(patch) != `{"metadata":{"uid":"old-uid"}}` {
+					t.Fatalf("unexpected patch %s: %s", name, patch)
+				}
+				return nil, test.err
+			})
+			if !called || complete != test.complete {
+				t.Fatalf("called=%v complete=%v", called, complete)
+			}
+		})
+	}
+}
 
 func TestHandlePodListFromMetaManager(t *testing.T) {
 	deletionTime := metav1.Now()

@@ -18,7 +18,8 @@ type WatchHook struct {
 	ResourceVersion uint64
 	id              string
 	Receiver
-	lock sync.Mutex
+	observedUID string
+	lock        sync.Mutex
 }
 
 func NewWatchHook(key string, rev uint64, receiver Receiver) (*WatchHook, error) {
@@ -55,6 +56,18 @@ func (h *WatchHook) GetName() string {
 }
 func (h *WatchHook) GetResourceVersion() uint64 {
 	return h.ResourceVersion
+}
+
+func (h *WatchHook) GetObservedUID() string {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	return h.observedUID
+}
+
+func (h *WatchHook) SetObservedUID(uid string) {
+	h.lock.Lock()
+	h.observedUID = uid
+	h.lock.Unlock()
 }
 
 func (h *WatchHook) Stop() {

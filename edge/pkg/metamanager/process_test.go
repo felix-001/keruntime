@@ -17,20 +17,30 @@ limitations under the License.
 package metamanager
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/golang/mock/gomock"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/kubeedge/beehive/pkg/common"
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
+	cloudmodules "github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
+	edgecontrollerConstants "github.com/kubeedge/kubeedge/cloud/pkg/edgecontroller/constants"
 	"github.com/kubeedge/kubeedge/common/constants"
 	"github.com/kubeedge/kubeedge/edge/mocks/beego"
 	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
@@ -38,7 +48,10 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	metaManagerConfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
+	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/watchhook"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha2"
+	metaconfig "github.com/kubeedge/kubeedge/pkg/apis/componentconfig/meta/v1alpha1"
 )
 
 const (
@@ -58,9 +71,475 @@ const (
 // errFailedDBOperation is common Database operation fail error
 var errFailedDBOperation = errors.New(FailedDBOperation)
 
+func TestResourceParsers(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		resource            string
+		wantType, wantID    string
+		wantApp, wantDomain string
+	}{
+		{name: "type", resource: "default/pod", wantType: model.ResourceTypePod},
+		{name: "id", resource: "default/pod/p1", wantType: model.ResourceTypePod, wantID: "p1"},
+		{name: "app", resource: "default/secret/s1/app", wantType: model.ResourceTypeSecret, wantID: "s1", wantApp: "app"},
+		{name: "domain", resource: "default/secret/s1/app/domain", wantType: model.ResourceTypeSecret, wantID: "s1", wantApp: "app", wantDomain: "domain"},
+		{name: "invalid", resource: "too/many/parts/here/again/extra"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, test.resource, model.QueryOperation)
+			_, gotType, gotID, gotApp, gotDomain := parseResource(message)
+			if gotType != test.wantType || gotID != test.wantID || gotApp != test.wantApp || gotDomain != test.wantDomain {
+				t.Fatalf("parseResource() = %q, %q, %q, %q", gotType, gotID, gotApp, gotDomain)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name, resource, wantNamespace, wantType, wantApp, wantDomain string
+	}{
+		{name: "four", resource: "apps/default/ns/pod", wantNamespace: "ns", wantType: model.ResourceTypePod},
+		{name: "six", resource: "apps/default/ns/secret/app/domain", wantNamespace: "ns", wantType: model.ResourceTypeSecret, wantApp: "app", wantDomain: "domain"},
+		{name: "invalid", resource: "ns/pod"},
+	} {
+		t.Run("appsd-"+test.name, func(t *testing.T) {
+			message := model.NewMessage("").BuildRouter(modules.AppsdModuleName, modules.MetaGroup, test.resource, model.QueryOperation)
+			_, namespace, resourceType, app, domain := parseResourceFromAppsd(message)
+			if namespace != test.wantNamespace || resourceType != test.wantType || app != test.wantApp || domain != test.wantDomain {
+				t.Fatalf("parseResourceFromAppsd() = %q, %q, %q, %q", namespace, resourceType, app, domain)
+			}
+		})
+	}
+
+	for _, labels := range []struct {
+		name, configType, app, domain, wantApp, wantDomain string
+	}{
+		{name: "nil"},
+		{name: "native", configType: constants.Native, app: "app", domain: "domain", wantApp: "app", wantDomain: "domain"},
+		{name: "non-native", configType: "custom", app: "app", domain: "domain"},
+	} {
+		t.Run("labels-"+labels.name, func(t *testing.T) {
+			input := map[string]string{}
+			if labels.name != "nil" {
+				input[edgecontrollerConstants.ConfigType] = labels.configType
+				input[edgecontrollerConstants.AppName] = labels.app
+				input[edgecontrollerConstants.Domain] = labels.domain
+			}
+			gotApp, gotDomain := parseLabels(input)
+			if gotApp != labels.wantApp || gotDomain != labels.wantDomain {
+				t.Fatalf("parseLabels() = %q, %q", gotApp, gotDomain)
+			}
+		})
+	}
+}
+
+func TestDeleteMissingPodValidation(t *testing.T) {
+	manager := newMetaManager(true)
+	for _, test := range []struct {
+		name, resource string
+		body           interface{}
+	}{
+		{name: "bad json", resource: "default/podpatch/pod", body: "{"},
+		{name: "missing uid", resource: "default/podpatch/pod", body: `{"metadata":{}}`},
+		{name: "bad resource", resource: "default/pod/pod", body: `{"metadata":{"uid":"u"}}`},
+		{name: "missing name", resource: "default/podpatch/", body: `{"metadata":{"uid":"u"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, test.resource, model.PatchOperation).FillBody(test.body)
+			if err := manager.deleteMissingPod(*message); err == nil {
+				t.Fatal("deleteMissingPod() unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestParseServiceAccountTokenResource(t *testing.T) {
+	request := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			Audiences: []string{"api"},
+		},
+	}
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/serviceaccounttoken/account", model.QueryOperation).FillBody(request)
+	key, resourceType, resourceID, app, domain := parseResource(message)
+	if key == "" || resourceType != model.ResourceTypeServiceAccountToken || resourceID != "" || app != "" || domain != "" {
+		t.Fatalf("unexpected service account resource: %q, %q, %q, %q, %q", key, resourceType, resourceID, app, domain)
+	}
+
+	for _, body := range []interface{}{make(chan int), "{"} {
+		message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+			"default/serviceaccounttoken/account", model.QueryOperation).FillBody(body)
+		if key, resourceType, resourceID, app, domain := parseResource(message); key != "" || resourceType != "" || resourceID != "" || app != "" || domain != "" {
+			t.Fatalf("invalid token request parsed as %q, %q, %q, %q, %q", key, resourceType, resourceID, app, domain)
+		}
+	}
+
+	message = model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/serviceaccounttoken/account/extra", model.QueryOperation).FillBody(request)
+	if key, _, _, _, _ := parseResource(message); key != "" {
+		t.Fatalf("invalid token resource parsed as %q", key)
+	}
+}
+
+func TestParseResourceFromObjectBoundaries(t *testing.T) {
+	for _, body := range []interface{}{`{"metadata":{"namespace":"ns","name":"secret"}}`, `{"metadata":{"namespace":"ns","name":"config"}}`, "{"} {
+		message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+			"", model.InsertOperation).FillBody(body)
+		key, app, domain := parseResourceFromObject(message)
+		if key != "" || app != "" || domain != "" {
+			t.Fatalf("unexpected unlabelled object result: %q, %q, %q", key, app, domain)
+		}
+	}
+
+	secret := &v1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "secret",
+		Labels: map[string]string{edgecontrollerConstants.ConfigType: constants.Native, edgecontrollerConstants.AppName: "app"},
+	}}
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"", model.InsertOperation).FillBody(secret)
+	key, app, domain := parseResourceFromObject(message)
+	if key == "" || app != "app" || domain != "" {
+		t.Fatalf("unexpected labelled secret result: %q, %q, %q", key, app, domain)
+	}
+}
+
+func TestProcessUnsupportedOperation(t *testing.T) {
+	manager := newMetaManager(true)
+	message := model.NewMessage("").BuildRouter(manager.Name(), modules.MetaGroup, "default/unknown", "unsupported")
+	manager.process(*message)
+}
+
+func TestProcessRemoteResponseBranches(t *testing.T) {
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdged, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	t.Cleanup(func() {
+		beehiveContext.Cleanup(ModuleNameEdgeHub)
+		beehiveContext.Cleanup(ModuleNameEdged)
+	})
+
+	for _, test := range []struct {
+		name    string
+		content interface{}
+	}{
+		{name: "success", content: constants.MessageSuccessfulContent},
+		{name: "error", content: errors.New("remote error")},
+		{name: "invalid json", content: []byte("{")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager.syncTransport = func(module string, message model.Message, _ time.Duration) (model.Message, error) {
+				if module != string(metaManagerConfig.Config.ContextSendModule) {
+					return model.Message{}, fmt.Errorf("unexpected destination %q", module)
+				}
+				return *message.NewRespByMessage(&message, test.content), nil
+			}
+			request := model.NewMessage("").BuildRouter(ModuleNameEdged, modules.MetaGroup,
+				"default/configmap/config", model.QueryOperation)
+			done := manager.processRemote(*request)
+			<-done
+			response, err := beehiveContext.Receive(ModuleNameEdged)
+			if err != nil {
+				t.Fatalf("receive response: %v", err)
+			}
+			if test.name != "invalid json" && response.GetParentID() != request.GetID() {
+				t.Fatalf("response parent ID = %q, want %q", response.GetParentID(), request.GetID())
+			}
+			if test.name == "invalid json" && response.GetContent() == nil {
+				t.Fatal("invalid JSON response did not produce an error")
+			}
+			if test.name != "invalid json" {
+				_, err = beehiveContext.Receive(ModuleNameEdgeHub)
+				if err != nil {
+					t.Fatalf("receive cloud response: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestProcessQueryFromAppsd(t *testing.T) {
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: modules.AppsdModuleName, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	connect.SetConnected(true)
+
+	for _, test := range []struct {
+		name       string
+		queryError bool
+	}{
+		{name: "success"},
+		{name: "database error", queryError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			previousDB := dbm.DBAccess
+			defer func() { dbm.DBAccess = previousDB }()
+			ormer := beego.NewMockOrmer(mockCtrl)
+			query := beego.NewMockQuerySeter(mockCtrl)
+			dbm.DBAccess = ormer
+			ormer.EXPECT().QueryTable(gomock.Any()).Return(query)
+			query.EXPECT().SetCond(gomock.Any()).Return(query)
+			query.EXPECT().All(gomock.Any()).DoAndReturn(func(target interface{}, _ ...string) (int64, error) {
+				if test.queryError {
+					return 0, errFailedDBOperation
+				}
+				*target.(*[]dao.Meta) = []dao.Meta{{Value: `{"metadata":{"name":"secret"}}`}}
+				return 1, nil
+			})
+
+			message := model.NewMessage("").BuildRouter(modules.AppsdModuleName, modules.MetaGroup,
+				"apps/default/ns/secret/app/domain", model.QueryOperation)
+			manager.processQuery(*message)
+			receiveModule := modules.AppsdModuleName
+			if test.queryError {
+				receiveModule = ModuleNameEdgeHub
+			}
+			response, err := beehiveContext.Receive(receiveModule)
+			if err != nil {
+				t.Fatalf("receive appsd response: %v", err)
+			}
+			if test.queryError {
+				if response.GetContent() == nil {
+					t.Fatal("database error response is empty")
+				}
+				return
+			}
+			values, ok := response.GetContent().([]string)
+			if !ok || len(values) != 1 || values[0] != `{"metadata":{"name":"secret"}}` {
+				t.Fatalf("unexpected appsd response: %#v", response.GetContent())
+			}
+		})
+	}
+}
+
+func TestAttachPodDeleteSnapshotBranches(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		body       interface{}
+		queryError bool
+		wantError  bool
+	}{
+		{name: "invalid json", body: "{", wantError: true},
+		{name: "full pod", body: &v1.Pod{Spec: v1.PodSpec{NodeName: "edge"}}},
+		{name: "query error", body: &v1.Pod{}, queryError: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			previousDB := dbm.DBAccess
+			defer func() { dbm.DBAccess = previousDB }()
+			if test.queryError {
+				ormer := beego.NewMockOrmer(mockCtrl)
+				query := beego.NewMockQuerySeter(mockCtrl)
+				dbm.DBAccess = ormer
+				ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(podSnapshotQueryRetries)
+				query.EXPECT().Filter("type", model.ResourceTypePod).Return(query).Times(podSnapshotQueryRetries)
+				query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(podSnapshotQueryRetries)
+			}
+			message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+				"default/pod/pod", model.DeleteOperation).FillBody(test.body)
+			err := attachPodDeleteSnapshot(message)
+			if (err != nil) != test.wantError {
+				t.Fatalf("attachPodDeleteSnapshot() error = %v, wantError=%v", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestProcessUpdateControllerSources(t *testing.T) {
+	for _, source := range []string{
+		cloudmodules.EdgeControllerModuleName,
+		cloudmodules.DynamicControllerModuleName,
+		cloudmodules.PolicyControllerModuleName,
+	} {
+		t.Run(source, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			previousDB := dbm.DBAccess
+			defer func() { dbm.DBAccess = previousDB }()
+			ormer := beego.NewMockOrmer(mockCtrl)
+			raw := beego.NewMockRawSeter(mockCtrl)
+			dbm.DBAccess = ormer
+			ormer.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(raw)
+			raw.EXPECT().Exec().Return(nil, nil)
+
+			beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdged, ModuleType: common.MsgCtxTypeChannel})
+			beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
+			beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+			t.Cleanup(func() {
+				beehiveContext.Cleanup(ModuleNameEdged)
+				beehiveContext.Cleanup(ModuleNameEdgeHub)
+			})
+
+			message := model.NewMessage("").BuildRouter(source, modules.MetaGroup,
+				"default/lease/lease", model.UpdateOperation).FillBody(`{"metadata":{"name":"lease"}}`)
+			newMetaManager(true).processUpdate(*message)
+			if source != cloudmodules.PolicyControllerModuleName {
+				if _, err := beehiveContext.Receive(ModuleNameEdged); err != nil {
+					t.Fatalf("receive edged update: %v", err)
+				}
+			}
+			if _, err := beehiveContext.Receive(ModuleNameEdgeHub); err != nil {
+				t.Fatalf("receive cloud response: %v", err)
+			}
+		})
+	}
+}
+
+func TestProcessUpdateDeviceController(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	raw := beego.NewMockRawSeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(raw)
+	raw.EXPECT().Exec().Return(nil, nil)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: modules.DeviceTwinModuleName, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	manager := newMetaManager(true)
+	message := model.NewMessage("").BuildRouter(cloudmodules.DeviceControllerModuleName, modules.MetaGroup,
+		"default/configmap/config", model.UpdateOperation).FillBody(`{"metadata":{"name":"config"}}`)
+	manager.processUpdate(*message)
+	twin, err := beehiveContext.Receive(modules.DeviceTwinModuleName)
+	if err != nil || twin.GetOperation() != model.UpdateOperation {
+		t.Fatalf("unexpected twin update: %+v, err=%v", twin, err)
+	}
+	response, err := beehiveContext.Receive(ModuleNameEdgeHub)
+	if err != nil || response.GetContent() != OK {
+		t.Fatalf("unexpected cloud response: %+v, err=%v", response, err)
+	}
+}
+
+func TestProcessPatchNonPod(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	raw := beego.NewMockRawSeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(raw)
+	raw.EXPECT().Exec().Return(nil, nil)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	t.Cleanup(func() { beehiveContext.Cleanup(ModuleNameEdgeHub) })
+
+	manager := newMetaManager(true)
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/configmap/config", model.PatchOperation).FillBody(`{"metadata":{"name":"config"}}`)
+	if done := manager.processPatch(*message); done != nil {
+		t.Fatal("non-pod patch unexpectedly used remote processing")
+	}
+	cloudMessage, err := beehiveContext.Receive(ModuleNameEdgeHub)
+	if err != nil {
+		t.Fatalf("receive cloud patch: %v", err)
+	}
+	if cloudMessage.GetOperation() != model.PatchOperation || cloudMessage.GetResource() != "default/configmap/config" {
+		t.Fatalf("unexpected cloud patch: %+v", cloudMessage.Router)
+	}
+}
+
+func TestProcessPodDeleteSnapshotRetryFailureReschedules(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	previousBackoff := podDeleteSnapshotRetryBackoff
+	defer func() { podDeleteSnapshotRetryBackoff = previousBackoff }()
+	podDeleteSnapshotRetryBackoff = 0
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(podSnapshotQueryRetries)
+	query.EXPECT().Filter("type", model.ResourceTypePod).Return(query).Times(podSnapshotQueryRetries)
+	query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(podSnapshotQueryRetries)
+
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: manager.Name(), ModuleType: common.MsgCtxTypeChannel})
+	t.Cleanup(func() { beehiveContext.Cleanup(manager.Name()) })
+	message := model.NewMessage("").BuildRouter(manager.Name(), modules.MetaGroup,
+		"default/pod/pod", podSnapshotRetryOperation).FillBody(&v1.Pod{})
+	manager.processPodDeleteSnapshotRetry(*message)
+
+	retries := make(chan model.Message, 1)
+	go func() {
+		if retry, err := beehiveContext.Receive(manager.Name()); err == nil {
+			retries <- retry
+		}
+	}()
+	select {
+	case retry := <-retries:
+		if retry.GetOperation() != podSnapshotRetryOperation {
+			t.Fatalf("retry operation = %q", retry.GetOperation())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed snapshot retry was not rescheduled")
+	}
+}
+
+func TestProcessDispatchesDelete(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query)
+	query.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(query)
+	query.EXPECT().Delete().Return(int64(1), nil)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdged, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	manager := newMetaManager(true)
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/lease/lease", model.DeleteOperation)
+	manager.process(*message)
+	if got, err := beehiveContext.Receive(ModuleNameEdged); err != nil || got.GetOperation() != model.DeleteOperation {
+		t.Fatalf("unexpected edged delete: %+v, err=%v", got, err)
+	}
+	if got, err := beehiveContext.Receive(ModuleNameEdgeHub); err != nil || got.GetContent() != OK {
+		t.Fatalf("unexpected delete response: %+v, err=%v", got, err)
+	}
+}
+
+func TestProcessDispatchesPatch(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	raw := beego.NewMockRawSeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(raw)
+	raw.EXPECT().Exec().Return(nil, nil)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	manager := newMetaManager(true)
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/configmap/config", model.PatchOperation).FillBody(`{"metadata":{"name":"config"}}`)
+	manager.process(*message)
+	patched, err := beehiveContext.Receive(ModuleNameEdgeHub)
+	if err != nil {
+		t.Fatalf("receive dispatched patch: %v", err)
+	}
+	if patched.GetOperation() != model.PatchOperation {
+		t.Fatalf("operation = %q, want %q", patched.GetOperation(), model.PatchOperation)
+	}
+}
+
 func init() {
-	cfg := v1alpha2.NewDefaultEdgeCoreConfig()
-	metaManagerConfig.InitConfigure(cfg.Modules.MetaManager)
+	metaManagerConfig.InitConfigure(&v1alpha2.MetaManager{
+		Enable:             true,
+		ContextSendGroup:   metaconfig.GroupName(modules.HubGroup),
+		ContextSendModule:  metaconfig.ModuleName(modules.EdgeHubModuleName),
+		RemoteQueryTimeout: 1,
+		MetaServer:         &v1alpha2.MetaServer{},
+	})
 
 	beehiveContext.InitContext([]string{common.MsgCtxTypeChannel})
 	add := &common.ModuleInfo{
@@ -576,17 +1055,21 @@ func TestProcessDelete(t *testing.T) {
 	fakeDaoArray := make([]dao.Meta, 1)
 	fakeDaoArray[0] = dao.Meta{Key: "Test", Value: string(podBytes)}
 	fakeDao = &fakeDaoArray
-	querySetterMock.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(querySetterMock).Times(3)
+	querySetterMock.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(querySetterMock).Times(4)
 	querySetterMock.EXPECT().All(gomock.Any()).SetArg(0, *fakeDao).Return(int64(1), nil).Times(1)
+	querySetterMock.EXPECT().All(gomock.Any()).SetArg(0, []v2.MetaV2{}).Return(int64(0), nil).Times(1)
 	querySetterMock.EXPECT().Delete().Return(int64(1), nil).Times(2)
-	ormerMock.EXPECT().QueryTable(gomock.Any()).Return(querySetterMock).Times(3)
+	ormerMock.EXPECT().QueryTable(gomock.Any()).Return(querySetterMock).Times(5)
+	snapshotQueryMock := beego.NewMockQuerySeter(mockCtrl)
+	querySetterMock.EXPECT().Filter("type", model.ResourceTypePod).Return(snapshotQueryMock)
+	snapshotQueryMock.EXPECT().All(gomock.Any()).SetArg(0, []dao.Meta{}).Return(int64(0), nil)
 
 	resource = fmt.Sprintf("test/%s/nginx", model.ResourceTypePod)
 	msg = model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, resource, model.DeleteOperation).FillBody(podBytes)
 	meta.processDelete(*msg)
 	message, _ = beehiveContext.Receive(ModuleNameEdged)
 	t.Run("SuccessDeletePodToEdged", func(t *testing.T) {
-		want := ModuleNameController
+		want := modules.MetaManagerModuleName
 		if message.GetSource() != want {
 			t.Errorf("Wrong message received : Wanted from source %v and Got from source %v", want, message.GetSource())
 		}
@@ -595,6 +1078,9 @@ func TestProcessDelete(t *testing.T) {
 		}
 		if message.GetResource() != resource {
 			t.Errorf("Wrong message received resource: Wanted %v and Got %v", resource, message.GetResource())
+		}
+		if snapshot, ok := message.GetContent().(PodDeleteSnapshot); !ok || len(snapshot) != 0 {
+			t.Errorf("Expected an empty pod delete snapshot, got %#v", message.GetContent())
 		}
 	})
 	message, _ = beehiveContext.Receive(ModuleNameEdgeHub)
@@ -610,6 +1096,515 @@ func TestProcessDelete(t *testing.T) {
 			t.Errorf("Wrong message received : Wanted %v and Got %v", constants.MessageSuccessfulContent, message.GetContent())
 		}
 	})
+}
+
+func TestPodCleanupDB(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		body          interface{}
+		stored        string
+		queryError    bool
+		v2Stored      string
+		v2QueryError  bool
+		deleteFailure int
+		wantError     bool
+	}{
+		{name: "missing UID", body: &v1.Pod{}, wantError: true},
+		{name: "bad content", body: "{", wantError: true},
+		{name: "marshal error", body: make(chan int), wantError: true},
+		{name: "query failure", queryError: true, wantError: true},
+		{name: "bad stored pod", stored: "{", wantError: true},
+		{name: "different UID", stored: `{"metadata":{"uid":"new"}}`},
+		{name: "duplicate delete"},
+		{name: "delete matching", stored: `{"metadata":{"uid":"old"}}`},
+		{name: "v2 failure", v2QueryError: true, wantError: true},
+		{name: "invalid v2", v2Stored: "{", wantError: true},
+		{name: "v2 different UID", v2Stored: `{"metadata":{"uid":"new"}}`},
+		{name: "v2 matching UID", v2Stored: `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod","namespace":"default","uid":"old"}}`},
+		{name: "v2 delete fails", v2Stored: `{"metadata":{"uid":"old"}}`, deleteFailure: 1, wantError: true},
+		{name: "patch delete fails", deleteFailure: 2, wantError: true},
+		{name: "meta delete fails", deleteFailure: 3, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			ormer := beego.NewMockOrmer(mockCtrl)
+			query := beego.NewMockQuerySeter(mockCtrl)
+			previous := dbm.DBAccess
+			dbm.DBAccess = ormer
+			defer func() { dbm.DBAccess = previous }()
+			ormer.EXPECT().QueryTable(gomock.Any()).Return(query).AnyTimes()
+			query.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(query).AnyTimes()
+			query.EXPECT().All(gomock.Any()).DoAndReturn(func(target interface{}, columns ...string) (int64, error) {
+				switch result := target.(type) {
+				case *[]dao.Meta:
+					if test.queryError {
+						return 0, errFailedDBOperation
+					}
+					if test.stored != "" {
+						*result = []dao.Meta{{Value: test.stored}}
+					}
+				case *[]v2.MetaV2:
+					if test.v2QueryError {
+						return 0, errFailedDBOperation
+					}
+					if test.v2Stored != "" {
+						*result = []v2.MetaV2{{Value: test.v2Stored}}
+					}
+				}
+				return 1, nil
+			}).AnyTimes()
+			deleted := 0
+			query.EXPECT().Delete().DoAndReturn(func() (int64, error) {
+				deleted++
+				if test.deleteFailure == 1 || test.deleteFailure == 2 && deleted == 1 || test.deleteFailure == 3 && deleted == 2 {
+					return 0, errFailedDBOperation
+				}
+				return 1, nil
+			}).AnyTimes()
+			body := test.body
+			if body == nil {
+				body = &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default", UID: "old"}}
+			}
+			message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, "default/pod/pod", model.DeleteOperation).FillBody(body)
+			err := processDeletePodDB(*message)
+			if (err != nil) != test.wantError {
+				t.Fatalf("err=%v", err)
+			}
+			if test.name == "different UID" && deleted != 0 {
+				t.Fatal("new UID deleted")
+			}
+		})
+	}
+}
+
+func TestProcessDeleteUIDMismatchIsIdempotent(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previous := dbm.DBAccess
+	defer func() { dbm.DBAccess = previous }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().All(gomock.Any()).DoAndReturn(func(target interface{}, columns ...string) (int64, error) {
+		switch result := target.(type) {
+		case *[]dao.Meta:
+			*result = []dao.Meta{{Value: `{"metadata":{"uid":"new"}}`}}
+		case *[]v2.MetaV2:
+			*result = []v2.MetaV2{{Key: "/core/v1/pods/default/pod",
+				Value: `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod","namespace":"default","uid":"old"}}`}}
+		}
+		return 1, nil
+	}).AnyTimes()
+	// Only the stale V2 record may be deleted; the V1 record of the new pod must be kept.
+	// A second delete means the V1 record was removed as well, which must not happen.
+	query.EXPECT().Delete().Return(int64(1), nil).Times(1)
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, "default/pod/pod", model.DeleteOperation).
+		FillBody(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod", UID: "old"}})
+	if err := processDeletePodDB(*message); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestProcessPodPatchResponse(t *testing.T) {
+	manager := newMetaManager(true)
+	for _, name := range []string{ModuleNameEdgeHub, ModuleNameEdged, manager.Name()} {
+		name := name
+		beehiveContext.AddModule(&common.ModuleInfo{ModuleName: name, ModuleType: common.MsgCtxTypeChannel})
+		t.Cleanup(func() { beehiveContext.Cleanup(name) })
+	}
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	for _, notFound := range []bool{false, true} {
+		t.Run(fmt.Sprintf("notFound=%v", notFound), func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			previous := dbm.DBAccess
+			defer func() { dbm.DBAccess = previous }()
+			ormer := beego.NewMockOrmer(mockCtrl)
+			raw := beego.NewMockRawSeter(mockCtrl)
+			query := beego.NewMockQuerySeter(mockCtrl)
+			dbm.DBAccess = ormer
+			ormer.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(raw).Times(1)
+			raw.EXPECT().Exec().Return(nil, nil).Times(1)
+			if notFound {
+				ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(5)
+				query.EXPECT().Filter("key", "default/pod/old-pod").Return(query).Times(2)
+				query.EXPECT().Filter("key", "/core/v1/pods/default/old-pod").Return(query)
+				query.EXPECT().Filter("key", "default/podpatch/old-pod").Return(query)
+				query.EXPECT().All(gomock.Any()).SetArg(0, []dao.Meta{{Value: `{"metadata":{"uid":"old-uid"}}`}}).Return(int64(1), nil)
+				query.EXPECT().All(gomock.Any()).SetArg(0, []v2.MetaV2{}).Return(int64(0), nil)
+				query.EXPECT().Delete().Return(int64(1), nil).Times(2)
+				snapshot := beego.NewMockQuerySeter(mockCtrl)
+				query.EXPECT().Filter("type", model.ResourceTypePod).Return(snapshot)
+				snapshot.EXPECT().All(gomock.Any()).SetArg(0, []dao.Meta{{Value: `{"metadata":{"uid":"remaining-uid"}}`}}).Return(int64(1), nil)
+			}
+			request := model.NewMessage("").BuildRouter(modules.EdgedModuleName, modules.MetaGroup, "default/podpatch/old-pod", model.PatchOperation).
+				FillBody(`{"metadata":{"uid":"old-uid"}}`)
+			request.Header.Sync = false
+			cloudResult := make(chan model.Message, 1)
+			cleanupResponse := make(chan model.Message, 1)
+			manager.syncTransport = func(module string, cloudRequest model.Message, _ time.Duration) (model.Message, error) {
+				if module == manager.Name() {
+					cloudRequest.Header.Sync = true
+					beehiveContext.Send(module, cloudRequest)
+					select {
+					case response := <-cleanupResponse:
+						if response.GetParentID() != cloudRequest.GetID() {
+							return model.Message{}, fmt.Errorf("local cleanup response not correlated")
+						}
+						return response, nil
+					case <-time.After(5 * time.Second):
+						return model.Message{}, fmt.Errorf("no local cleanup response")
+					}
+				}
+				if module != ModuleNameEdgeHub {
+					return model.Message{}, fmt.Errorf("unexpected sync destination %q", module)
+				}
+				response := cloudRequest.NewRespByMessage(&cloudRequest, map[string]interface{}{
+					"Object": map[string]interface{}{"metadata": map[string]interface{}{"uid": "old-uid"}}, "Err": nil,
+				})
+				if notFound {
+					response.Content = map[string]interface{}{"Object": nil, "Err": map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(404)}}}
+				}
+				cloudResult <- cloudRequest
+				return *response, nil
+			}
+			done := manager.processPatch(*request)
+			if done == nil {
+				t.Fatal("PATCH bypassed processRemote")
+			}
+			defer func() { <-done }()
+			select {
+			case cloudRequest := <-cloudResult:
+				if cloudRequest.GetID() == request.GetID() {
+					t.Fatal("PATCH bypassed processRemote")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("PATCH did not reach cloud")
+			}
+			receive := func(module string) model.Message {
+				result := make(chan model.Message, 1)
+				go func() {
+					message, _ := beehiveContext.Receive(module)
+					result <- message
+				}()
+				select {
+				case message := <-result:
+					return message
+				case <-time.After(5 * time.Second):
+					t.Fatalf("no message received by %s", module)
+					return model.Message{}
+				}
+			}
+			if notFound {
+				queued := receive(manager.Name())
+				if queued.GetOperation() != model.DeleteOperation || queued.GetResource() != "default/pod/old-pod" {
+					t.Fatalf("unexpected queued delete: %+v", queued)
+				}
+				manager.process(queued)
+				deleted := receive(ModuleNameEdged)
+				if deleted.GetOperation() != model.DeleteOperation || deleted.GetResource() != "default/pod/old-pod" {
+					t.Fatalf("unexpected delete notification: %+v", deleted)
+				}
+				pods, ok := deleted.GetContent().(PodDeleteSnapshot)
+				if deleted.GetType() != queued.GetType() || !deleted.IsSync() || deleted.GetID() != queued.GetID() ||
+					!ok || len(pods) != 1 || pods[0] != `{"metadata":{"uid":"remaining-uid"}}` {
+					t.Fatalf("unexpected delete snapshot: %+v", deleted)
+				}
+				cleanupResponse <- *deleted.NewRespByMessage(&deleted, OK)
+			}
+			response := receive(ModuleNameEdged)
+			if response.GetParentID() != request.GetID() {
+				t.Fatalf("response not correlated: %+v", response)
+			}
+			body, ok := response.Content.(map[string]interface{})
+			if !ok || !isObjectResp(body) || (body["Err"] != nil) != notFound {
+				t.Fatalf("ObjectResp contract lost: %+v", response)
+			}
+			receive(ModuleNameEdgeHub)
+		})
+	}
+}
+
+func TestIsPodPatchNotFound(t *testing.T) {
+	status404 := map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(404)}}
+	for _, test := range []struct {
+		name     string
+		resource string
+		err      interface{}
+		want     bool
+	}{
+		{name: "pod patch 404", resource: "default/podpatch/pod", err: status404, want: true},
+		{name: "pod 404", resource: "default/pod/pod", err: status404},
+		{name: "forbidden", resource: "default/podpatch/pod", err: map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(403)}}},
+		{name: "conflict", resource: "default/podpatch/pod", err: map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(409)}}},
+		{name: "plain error", resource: "default/podpatch/pod", err: "not found"},
+		{name: "missing status", resource: "default/podpatch/pod", err: map[string]interface{}{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, test.resource, model.PatchOperation)
+			if got := isPodPatchNotFound(*message, test.err); got != test.want {
+				t.Fatalf("isPodPatchNotFound() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPodPatchErrorEvidence(t *testing.T) {
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/podpatch/pod", model.PatchOperation)
+	resource := schema.GroupResource{Resource: "pods"}
+	tests := []struct {
+		name            string
+		err             error
+		wantNotFound    bool
+		wantUIDMismatch bool
+	}{
+		{name: "real not found", err: apierrors.NewNotFound(resource, "pod"), wantNotFound: true},
+		{name: "proxy not found", err: apierrors.NewGenericServerResponse(404, "PATCH", resource, "pod", "proxy", 0, true)},
+		{name: "uid mismatch", err: apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "pod",
+			field.ErrorList{field.Invalid(field.NewPath("metadata", "uid"), "old", "uid changed")}), wantUIDMismatch: true},
+		{name: "generic conflict", err: apierrors.NewConflict(resource, "pod", fmt.Errorf("conflict"))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			statusErr := test.err.(*apierrors.StatusError)
+			content, err := json.Marshal(map[string]interface{}{"ErrStatus": statusErr.ErrStatus})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var response map[string]interface{}
+			if err := json.Unmarshal(content, &response); err != nil {
+				t.Fatal(err)
+			}
+			if got := isPodPatchNotFound(*message, response); got != test.wantNotFound {
+				t.Fatalf("isPodPatchNotFound() = %v, want %v", got, test.wantNotFound)
+			}
+			if got := isPodPatchUIDMismatch(*message, response); got != test.wantUIDMismatch {
+				t.Fatalf("isPodPatchUIDMismatch() = %v, want %v", got, test.wantUIDMismatch)
+			}
+		})
+	}
+}
+
+func TestDeleteMissingPodBuildsNamedDelete(t *testing.T) {
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: manager.Name(), ModuleType: common.MsgCtxTypeChannel})
+	t.Cleanup(func() { beehiveContext.Cleanup(manager.Name()) })
+	deleted := make(chan model.Message, 1)
+	go func() {
+		request, err := beehiveContext.Receive(manager.Name())
+		if err != nil {
+			return
+		}
+		deleted <- request
+		beehiveContext.SendResp(*request.NewRespByMessage(&request, OK))
+	}()
+
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/podpatch/old-pod", model.PatchOperation).
+		FillBody([]byte(`{"metadata":{"uid":"old-uid"}}`))
+	if err := manager.deleteMissingPod(*message); err != nil {
+		t.Fatalf("deleteMissingPod: %v", err)
+	}
+	var deleteMessage model.Message
+	select {
+	case deleteMessage = <-deleted:
+	default:
+		t.Fatal("deleteMissingPod did not send a delete request")
+	}
+	if deleteMessage.GetSource() != manager.Name() || deleteMessage.GetGroup() != modules.MetaGroup ||
+		deleteMessage.GetResource() != "default/pod/old-pod" || deleteMessage.GetOperation() != model.DeleteOperation {
+		t.Fatalf("unexpected delete route: %+v", deleteMessage.Router)
+	}
+	pod, ok := deleteMessage.GetContent().(*v1.Pod)
+	if !ok || pod == nil || pod.Namespace != "default" || pod.Name != "old-pod" || pod.UID != "old-uid" {
+		t.Fatalf("unexpected delete body: %T %+v", deleteMessage.GetContent(), deleteMessage.GetContent())
+	}
+}
+
+func TestPodDeleteSnapshotRetry(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	previousBackoff := podDeleteSnapshotRetryBackoff
+	defer func() { podDeleteSnapshotRetryBackoff = previousBackoff }()
+	podDeleteSnapshotRetryBackoff = 0
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	snapshot := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(1)
+	query.EXPECT().Filter("type", model.ResourceTypePod).Return(query)
+	query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(1)
+
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: manager.Name(), ModuleType: common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdged, ModuleType: common.MsgCtxTypeChannel})
+	t.Cleanup(func() { beehiveContext.Cleanup(manager.Name()) })
+	t.Cleanup(func() { beehiveContext.Cleanup(ModuleNameEdged) })
+	message := model.NewMessage("").BuildRouter(manager.Name(), modules.MetaGroup,
+		"default/pod/pod", model.DeleteOperation).FillBody(&v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod", UID: "deleted"},
+	})
+	manager.schedulePodDeleteSnapshotRetry(*message)
+
+	retryMessages := make(chan model.Message, 1)
+	go func() {
+		got, err := beehiveContext.Receive(manager.Name())
+		if err == nil {
+			retryMessages <- got
+		}
+	}()
+	select {
+	case got := <-retryMessages:
+		if got.GetOperation() != podSnapshotRetryOperation {
+			t.Fatalf("unexpected retry operation: %s", got.GetOperation())
+		}
+		ormer.EXPECT().QueryTable(gomock.Any()).Return(snapshot).Times(1)
+		snapshot.EXPECT().Filter("type", model.ResourceTypePod).Return(snapshot)
+		snapshot.EXPECT().All(gomock.Any()).SetArg(0, []dao.Meta{{Value: `{"metadata":{"uid":"remaining"}}`}}).Return(int64(1), nil)
+		manager.process(got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("pod delete snapshot retry was not scheduled")
+	}
+
+	received := make(chan model.Message, 1)
+	go func() {
+		got, err := beehiveContext.Receive(ModuleNameEdged)
+		if err == nil {
+			received <- got
+		}
+	}()
+	select {
+	case got := <-received:
+		pods, ok := got.Content.(PodDeleteSnapshot)
+		if !ok || len(pods) != 1 || pods[0] != `{"metadata":{"uid":"remaining"}}` {
+			t.Fatalf("unexpected retry snapshot: %#v", got.Content)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pod delete snapshot was not retried")
+	}
+}
+
+func TestSchedulePodDeleteSnapshotRetryDoesNotBlock(t *testing.T) {
+	previousBackoff := podDeleteSnapshotRetryBackoff
+	defer func() { podDeleteSnapshotRetryBackoff = previousBackoff }()
+	podDeleteSnapshotRetryBackoff = time.Hour
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: manager.Name(), ModuleType: common.MsgCtxTypeChannel})
+	t.Cleanup(func() { beehiveContext.Cleanup(manager.Name()) })
+	message := model.NewMessage("").BuildRouter(manager.Name(), modules.MetaGroup,
+		"default/pod/pod", model.DeleteOperation).FillBody(&v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod", UID: "deleted"},
+	})
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			manager.schedulePodDeleteSnapshotRetry(*message)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduling snapshot retries blocked the caller")
+	}
+}
+
+func TestProcessDeletePodWithoutV2RecordTriggersWatch(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().All(gomock.Any()).DoAndReturn(func(target interface{}, _ ...string) (int64, error) {
+		switch result := target.(type) {
+		case *[]dao.Meta:
+			*result = nil
+		case *[]v2.MetaV2:
+			*result = nil
+		}
+		return 0, nil
+	}).AnyTimes()
+	query.EXPECT().Delete().Return(int64(1), nil).Times(2)
+
+	events := make(chan watch.Event, 1)
+	hook, err := watchhook.NewWatchHook("/core/v1/pods/default/pod", 200, watchhook.NewChanReceiver(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hook.Stop()
+
+	pod := &v1.Pod{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default", UID: "uid", ResourceVersion: "300"},
+		Spec:       v1.PodSpec{NodeName: "edge"},
+	}
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/pod/pod", model.DeleteOperation).FillBody(pod)
+	if err := processDeletePodDB(*message); err != nil {
+		t.Fatalf("processDeletePodDB: %v", err)
+	}
+	select {
+	case event := <-events:
+		if event.Type != watch.Deleted {
+			t.Fatalf("event type = %s, want Deleted", event.Type)
+		}
+		object, ok := event.Object.(*unstructured.Unstructured)
+		if !ok || object.GetUID() != pod.GetUID() {
+			t.Fatalf("unexpected deleted object: %#v", event.Object)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing deleted watch event")
+	}
+}
+
+func TestProcessRemoteNodeCreatePreservesObjectResp(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	raw := beego.NewMockRawSeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(raw)
+	raw.EXPECT().Exec().DoAndReturn(func() (sql.Result, error) {
+		return nil, nil
+	})
+
+	manager := newMetaManager(true)
+	for _, name := range []string{ModuleNameEdged, ModuleNameEdgeHub} {
+		beehiveContext.AddModule(&common.ModuleInfo{ModuleName: name, ModuleType: common.MsgCtxTypeChannel})
+		t.Cleanup(func() { beehiveContext.Cleanup(name) })
+	}
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	manager.syncTransport = func(module string, message model.Message, _ time.Duration) (model.Message, error) {
+		if module != ModuleNameEdgeHub {
+			return model.Message{}, fmt.Errorf("unexpected sync destination %q", module)
+		}
+		return *message.NewRespByMessage(&message, []byte(`{"Object":{"metadata":{"name":"node"}},"Err":null}`)), nil
+	}
+	request := model.NewMessage("").BuildRouter(ModuleNameEdged, modules.MetaGroup,
+		"default/node/node", model.InsertOperation).FillBody(`{"metadata":{"name":"node"}}`)
+	done := manager.processRemote(*request)
+	<-done
+
+	response, err := beehiveContext.Receive(ModuleNameEdged)
+	if err != nil {
+		t.Fatalf("receive node response: %v", err)
+	}
+	objectResp, ok := response.Content.(map[string]interface{})
+	if !ok || !isObjectResp(objectResp) || objectResp["Object"] == nil {
+		t.Fatalf("node ObjectResp contract lost: %#v", response.Content)
+	}
 }
 
 // TestProcessQuery is function to test processQuery
