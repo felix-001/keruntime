@@ -396,7 +396,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		resyncInterval:                          kubeCfg.SyncFrequency.Duration,
 		sourcesReady:                            config.NewSourcesReady(kubeDeps.PodConfig.SeenAllSources),
 		registerNode:                            registerNode,
-		nodeType: 								 nodeType,
+		nodeType:                                nodeType,
 		registerWithTaints:                      registerWithTaints,
 		registerSchedulable:                     registerSchedulable,
 		dnsConfigurer:                           dns.NewConfigurer(kubeDeps.Recorder, nodeRef, nodeIPs, clusterDNS, kubeCfg.ClusterDomain, kubeCfg.ResolverConfig),
@@ -815,7 +815,7 @@ type Kubelet struct {
 	// a list of node labels to register
 	nodeLabels map[string]string
 	// edge node type, keruntime specific field
-	nodeType string 
+	nodeType string
 	// Last timestamp when runtime responded on ping.
 	// Mutex is used to protect this value.
 	runtimeState *runtimeState
@@ -1372,9 +1372,13 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 // the most accurate information possible about an error situation to aid debugging.
 // Callers should not write an event if this operation returns an error.
 func (kl *Kubelet) syncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, podStatus *kubecontainer.PodStatus) (isTerminal bool, err error) {
-	klog.V(4).InfoS("syncPod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+	klog.InfoS("Kubelet syncPod started", "pod", klog.KObj(pod), "podUID", pod.UID, "updateType", updateType)
 	defer func() {
-		klog.V(4).InfoS("syncPod exit", "pod", klog.KObj(pod), "podUID", pod.UID, "isTerminal", isTerminal)
+		if err != nil {
+			klog.ErrorS(err, "Kubelet syncPod failed", "pod", klog.KObj(pod), "podUID", pod.UID, "updateType", updateType, "isTerminal", isTerminal)
+			return
+		}
+		klog.InfoS("Kubelet syncPod completed", "pod", klog.KObj(pod), "podUID", pod.UID, "updateType", updateType, "isTerminal", isTerminal)
 	}()
 
 	// Latency measurements for the main workflow are relative to the
@@ -2081,6 +2085,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 func (kl *Kubelet) HandlePodUpdates(pods []*v1.Pod) {
 	start := kl.clock.Now()
 	for _, pod := range pods {
+		klog.InfoS("Kubelet received pod update", "pod", klog.KObj(pod), "podUID", pod.UID)
 		kl.podManager.UpdatePod(pod)
 		kl.dispatchWork(pod, kubetypes.SyncPodUpdate, nil, start)
 	}

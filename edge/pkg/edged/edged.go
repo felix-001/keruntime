@@ -218,6 +218,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 			klog.Errorf("get message content data failed: %v", err)
 			continue
 		}
+		klog.InfoS("Edged received message", "messageID", result.GetID(), "resource", result.GetResource(), "operation", result.GetOperation(), "source", result.GetSource(), "resourceType", resType)
 
 		switch resType {
 		case model.ResourceTypePod:
@@ -296,6 +297,7 @@ func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interfac
 
 	var info *model.Message
 	if filterPodByNodeName(&pod, e.nodeName) {
+		klog.InfoS("Edged sending pod update to kubelet", "node", e.nodeName, "pod", klog.KObj(&pod), "podUID", pod.UID, "operation", op)
 		labels := pods[0].ObjectMeta.Labels
 		appType, appName := "", ""
 		if labels != nil {
@@ -323,6 +325,8 @@ func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interfac
 		}
 		updates := &kubelettypes.PodUpdate{Op: kubelettypes.UPDATE, Pods: pods, Source: kubelettypes.ApiserverSource}
 		updatesChan <- *updates
+	} else {
+		klog.InfoS("Edged skipped pod for another node", "node", e.nodeName, "pod", klog.KObj(&pod), "podUID", pod.UID, "operation", op, "podNode", pod.Spec.NodeName)
 	}
 
 	return nil

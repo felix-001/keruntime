@@ -15,8 +15,8 @@ import (
 	cloudmodules "github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	edgecontrollerConstants "github.com/kubeedge/kubeedge/cloud/pkg/edgecontroller/constants"
 	"github.com/kubeedge/kubeedge/common/constants"
-	edgeCommonMessage "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
+	edgeCommonMessage "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	metaManagerConfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
@@ -33,6 +33,7 @@ const (
 )
 
 func feedbackError(err error, request model.Message) {
+	klog.ErrorS(err, "MetaManager failed to process message", "messageID", request.GetID(), "resource", request.GetResource(), "operation", request.GetOperation(), "source", request.GetSource())
 	errResponse := model.NewErrorMessage(&request, err.Error()).SetRoute(modules.MetaManagerModuleName, request.GetGroup())
 	if request.GetSource() == modules.EdgedModuleName {
 		sendToEdged(errResponse, request.IsSync())
@@ -49,6 +50,7 @@ func feedbackResponse(message *model.Message, parentID string, resp *model.Messa
 }
 
 func sendToEdged(message *model.Message, sync bool) {
+	klog.InfoS("MetaManager sending message to edged", "messageID", message.GetID(), "resource", message.GetResource(), "operation", message.GetOperation(), "sync", sync)
 	if sync {
 		beehiveContext.SendResp(*message)
 	} else {
@@ -157,16 +159,16 @@ func msgDebugInfo(message *model.Message) string {
 
 func parseLabels(labels map[string]string) (string, string) {
 	if labels == nil || len(labels) == 0 {
-			return "", ""
+		return "", ""
 	}
 	appName, domain := "", ""
 	configType := labels[edgecontrollerConstants.ConfigType]
 	if configType == constants.Native {
 		if val, ok := labels[edgecontrollerConstants.AppName]; ok {
-				appName = val
+			appName = val
 		}
 		if val, ok := labels[edgecontrollerConstants.Domain]; ok {
-				domain = val
+			domain = val
 		}
 	}
 	return appName, domain
@@ -203,6 +205,7 @@ func parseResourceFromObject(message *model.Message) (string, string, string) {
 
 func (m *metaManager) handleMessage(message *model.Message) error {
 	resKey, resType, _, appName, domain := parseResource(message)
+	klog.InfoS("MetaManager handling message", "messageID", message.GetID(), "resource", message.GetResource(), "operation", message.GetOperation(), "source", message.GetSource(), "resourceType", resType)
 	if appName == "" || domain == "" {
 		objResKey, objAppName, objDomain := parseResourceFromObject(message)
 		if objAppName != "" {
@@ -275,6 +278,7 @@ func (m *metaManager) processInsert(message model.Message) {
 		// Notify edged
 		sendToEdged(&message, false)
 	}
+	klog.InfoS("MetaManager processed insert message", "messageID", message.GetID(), "resource", message.GetResource(), "source", msgSource)
 
 	resp := message.NewRespByMessage(&message, OK)
 	sendToCloud(resp)
@@ -307,6 +311,7 @@ func (m *metaManager) processUpdate(message model.Message) {
 		sendToEdged(resp, message.IsSync())
 	case cloudmodules.EdgeControllerModuleName, cloudmodules.DynamicControllerModuleName:
 		sendToEdged(&message, message.IsSync())
+		klog.InfoS("MetaManager forwarded update message to edged", "messageID", message.GetID(), "resource", message.GetResource(), "source", msgSource)
 		resp := message.NewRespByMessage(&message, OK)
 		sendToCloud(resp)
 	case cloudmodules.DeviceControllerModuleName:
@@ -584,7 +589,7 @@ func (m *metaManager) runMetaManager() {
 				klog.Errorf("get a message %+v: %v", msg, err)
 				continue
 			}
-			klog.V(2).Infof("get a message %+v", msg)
+			klog.InfoS("MetaManager received message", "messageID", msg.GetID(), "resource", msg.GetResource(), "operation", msg.GetOperation(), "source", msg.GetSource())
 			m.process(msg)
 		}
 	}()

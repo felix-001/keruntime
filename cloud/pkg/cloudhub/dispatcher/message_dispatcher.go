@@ -150,6 +150,12 @@ func (md *messageDispatcher) DispatchDownstream() {
 				klog.Warningf("skip message not to edge node %s: %+v, content %s", nodeID, msg)
 				continue
 			}
+			klog.InfoS("Dispatching downstream message to edge",
+				"node", nodeID,
+				"messageID", msg.GetID(),
+				"resource", msg.GetResource(),
+				"operation", msg.GetOperation(),
+				"resourceVersion", msg.GetResourceVersion())
 
 			_, isSelfConnect := md.SessionManager.IsNodeConnectSelf(nodeID)
 			if !isSelfConnect {
@@ -219,11 +225,13 @@ func (md *messageDispatcher) enqueueNoAckMessage(nodeID string, msg *beehivemode
 		return
 	}
 	nodeMessagePool.NoAckMessageQueue.Add(messageKey)
+	klog.InfoS("Enqueued downstream no-ack message", "node", nodeID, "messageID", msg.GetID(), "resource", msg.GetResource(), "operation", msg.GetOperation())
 }
 
 func (md *messageDispatcher) enqueueAckMessage(nodeID string, msg *beehivemodel.Message) {
 	// Message that require ack MUST have resource version.
 	if msg.GetResourceVersion() == "" && !isDeleteMessage(msg) {
+		klog.Warningf("skip downstream message without resource version, node %s, messageID %s, resource %s, operation %s", nodeID, msg.GetID(), msg.GetResource(), msg.GetOperation())
 		return
 	}
 
@@ -245,6 +253,7 @@ func (md *messageDispatcher) enqueueAckMessage(nodeID string, msg *beehivemodel.
 				return
 			}
 			nodeQueue.Add(messageKey)
+			klog.InfoS("Enqueued downstream ack message", "node", nodeID, "messageID", msg.GetID(), "resource", msg.GetResource(), "operation", msg.GetOperation())
 		}
 	}()
 
