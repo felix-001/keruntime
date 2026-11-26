@@ -285,7 +285,7 @@ func MakeKubeClientBridge(kubeletDeps *kubelet.Dependencies) {
 	kubeletDeps.HeartbeatClient = client
 }
 
-func (e *edged) handlePod(op, messageID string, content []byte, updatesChan chan<- interface{}) (err error) {
+func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interface{}) (err error) {
 	var pod v1.Pod
 	err = json.Unmarshal(content, &pod)
 	if err != nil {
@@ -327,10 +327,10 @@ func (e *edged) handlePod(op, messageID string, content []byte, updatesChan chan
 			}
 		}
 		updates := &kubelettypes.PodUpdate{Op: kubelettypes.UPDATE, Pods: pods, Source: kubelettypes.ApiserverSource}
-		klog.InfoS("Pod sync: Edged submitting pod update to kubelet config", "operation", op, "pod", klog.KObj(&pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "messageID", messageID, "deletionTimestamp", pod.DeletionTimestamp)
+		klog.InfoS("Pod sync: Edged submitting pod update to kubelet config", "operation", op, "pod", klog.KObj(&pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "deletionTimestamp", pod.DeletionTimestamp)
 		updatesChan <- *updates
 	} else {
-		klog.InfoS("Pod sync: Edged ignored pod for another node", "operation", op, "pod", klog.KObj(&pod), "podUID", pod.UID, "podNode", pod.Spec.NodeName, "node", e.nodeName, "messageID", messageID)
+		klog.InfoS("Pod sync: Edged ignored pod for another node", "operation", op, "pod", klog.KObj(&pod), "podUID", pod.UID, "podNode", pod.Spec.NodeName, "node", e.nodeName)
 	}
 
 	return nil

@@ -46,6 +46,8 @@ const (
 	podSnapshotQueryBackoff = time.Second
 )
 
+var podDeleteSnapshotRetryBackoff = time.Second
+
 func feedbackError(err error, request model.Message) {
 	errResponse := model.NewErrorMessage(&request, err.Error()).SetRoute(modules.MetaManagerModuleName, request.GetGroup())
 	if request.GetSource() == modules.EdgedModuleName {
@@ -382,8 +384,18 @@ func (m *metaManager) processDelete(message model.Message) {
 	localCleanup := resType == model.ResourceTypePod && message.GetSource() == m.Name() && message.IsSync()
 	err := m.handleMessage(&message)
 	edgedMessage := message
+	snapshotPending := false
 	if err == nil && resType == model.ResourceTypePod && message.GetSource() != cloudmodules.PolicyControllerModuleName {
 		err = attachPodDeleteSnapshot(&edgedMessage)
+		if err != nil {
+			m.retryPodDeleteSnapshot(message)
+			snapshotPending = true
+			if localCleanup {
+				beehiveContext.SendResp(*message.NewRespByMessage(&message, OK))
+				return
+			}
+			err = nil
+		}
 	}
 	if err != nil {
 		if localCleanup {
@@ -403,7 +415,7 @@ func (m *metaManager) processDelete(message model.Message) {
 		beehiveContext.Send(modules.DeviceTwinModuleName, message)
 	}
 
-	if msgSource != cloudmodules.PolicyControllerModuleName {
+	if msgSource != cloudmodules.PolicyControllerModuleName && !snapshotPending {
 		// Notify edged
 		if localCleanup {
 			beehiveContext.Send(modules.EdgedModuleName, edgedMessage)
@@ -413,6 +425,31 @@ func (m *metaManager) processDelete(message model.Message) {
 	}
 	resp := message.NewRespByMessage(&message, OK)
 	sendToCloud(resp)
+}
+
+func (m *metaManager) retryPodDeleteSnapshot(message model.Message) {
+	m.podDeleteRetryOnce.Do(func() {
+		go m.runPodDeleteSnapshotRetry()
+	})
+	m.podDeleteRetry <- message
+}
+
+func (m *metaManager) runPodDeleteSnapshotRetry() {
+	for {
+		select {
+		case <-beehiveContext.Done():
+			return
+		case message := <-m.podDeleteRetry:
+			edgedMessage := message
+			for {
+				if err := attachPodDeleteSnapshot(&edgedMessage); err == nil {
+					sendToEdged(&edgedMessage, false)
+					break
+				}
+				time.Sleep(podDeleteSnapshotRetryBackoff)
+			}
+		}
+	}
 }
 
 func attachPodDeleteSnapshot(message *model.Message) error {
@@ -655,6 +692,16 @@ func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
 			klog.V(4).Infof("process remote objResp: %+v", mapContent["Object"])
 			_, resType, _, _, _ := parseResource(&message)
 			if resType == model.ResourceTypePodPatch || resType == model.ResourceTypeLease {
+				feedbackResponse(&message, originalID, &resp)
+				return
+			}
+			if resType == model.ResourceTypeNode && message.GetOperation() == model.InsertOperation {
+				cacheResp := resp
+				cacheResp.Content = mapContent["Object"]
+				if err := m.handleMessage(&cacheResp); err != nil {
+					feedbackError(err, message)
+					return
+				}
 				feedbackResponse(&message, originalID, &resp)
 				return
 			}

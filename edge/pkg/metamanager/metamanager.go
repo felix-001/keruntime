@@ -1,6 +1,7 @@
 package metamanager
 
 import (
+	"sync"
 	"time"
 
 	"github.com/astaxie/beego/orm"
@@ -20,15 +21,18 @@ import (
 )
 
 type metaManager struct {
-	enable        bool
-	syncTransport func(string, model.Message, time.Duration) (model.Message, error)
+	enable             bool
+	syncTransport      func(string, model.Message, time.Duration) (model.Message, error)
+	podDeleteRetry     chan model.Message
+	podDeleteRetryOnce sync.Once
 }
 
 var _ core.Module = (*metaManager)(nil)
 
 func newMetaManager(enable bool) *metaManager {
 	return &metaManager{
-		enable: enable,
+		enable:         enable,
+		podDeleteRetry: make(chan model.Message, 16),
 	}
 }
 

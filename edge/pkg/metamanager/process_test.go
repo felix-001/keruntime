@@ -17,6 +17,7 @@ limitations under the License.
 package metamanager
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -908,6 +909,92 @@ func TestDeleteMissingPodBuildsNamedDelete(t *testing.T) {
 	pod, ok := deleteMessage.GetContent().(*v1.Pod)
 	if !ok || pod == nil || pod.Namespace != "default" || pod.Name != "old-pod" || pod.UID != "old-uid" {
 		t.Fatalf("unexpected delete body: %T %+v", deleteMessage.GetContent(), deleteMessage.GetContent())
+	}
+}
+
+func TestPodDeleteSnapshotRetry(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	previousBackoff := podDeleteSnapshotRetryBackoff
+	defer func() { podDeleteSnapshotRetryBackoff = previousBackoff }()
+	podDeleteSnapshotRetryBackoff = 0
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	snapshot := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(1)
+	query.EXPECT().Filter("type", model.ResourceTypePod).Return(query)
+	query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(1)
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(snapshot).Times(1)
+	snapshot.EXPECT().Filter("type", model.ResourceTypePod).Return(snapshot)
+	snapshot.EXPECT().All(gomock.Any()).SetArg(0, []dao.Meta{{Value: `{"metadata":{"uid":"remaining"}}`}}).Return(int64(1), nil)
+
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdged, ModuleType: common.MsgCtxTypeChannel})
+	t.Cleanup(func() { beehiveContext.Cleanup(ModuleNameEdged) })
+	message := model.NewMessage("").BuildRouter(manager.Name(), modules.MetaGroup,
+		"default/pod/pod", model.DeleteOperation).FillBody(&v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod", UID: "deleted"},
+	})
+	manager.retryPodDeleteSnapshot(*message)
+
+	received := make(chan model.Message, 1)
+	go func() {
+		got, err := beehiveContext.Receive(ModuleNameEdged)
+		if err == nil {
+			received <- got
+		}
+	}()
+	select {
+	case got := <-received:
+		pods, ok := got.Content.(PodDeleteSnapshot)
+		if !ok || len(pods) != 1 || pods[0] != `{"metadata":{"uid":"remaining"}}` {
+			t.Fatalf("unexpected retry snapshot: %#v", got.Content)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pod delete snapshot was not retried")
+	}
+}
+
+func TestProcessRemoteNodeCreatePreservesObjectResp(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	ormer := beego.NewMockOrmer(mockCtrl)
+	raw := beego.NewMockRawSeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(raw)
+	raw.EXPECT().Exec().DoAndReturn(func() (sql.Result, error) {
+		return nil, nil
+	})
+
+	manager := newMetaManager(true)
+	for _, name := range []string{ModuleNameEdged, ModuleNameEdgeHub} {
+		beehiveContext.AddModule(&common.ModuleInfo{ModuleName: name, ModuleType: common.MsgCtxTypeChannel})
+		t.Cleanup(func() { beehiveContext.Cleanup(name) })
+	}
+	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	manager.syncTransport = func(module string, message model.Message, _ time.Duration) (model.Message, error) {
+		if module != ModuleNameEdgeHub {
+			return model.Message{}, fmt.Errorf("unexpected sync destination %q", module)
+		}
+		return *message.NewRespByMessage(&message, []byte(`{"Object":{"metadata":{"name":"node"}},"Err":null}`)), nil
+	}
+	request := model.NewMessage("").BuildRouter(ModuleNameEdged, modules.MetaGroup,
+		"default/node/node", model.InsertOperation).FillBody(`{"metadata":{"name":"node"}}`)
+	done := manager.processRemote(*request)
+	<-done
+
+	response, err := beehiveContext.Receive(ModuleNameEdged)
+	if err != nil {
+		t.Fatalf("receive node response: %v", err)
+	}
+	objectResp, ok := response.Content.(map[string]interface{})
+	if !ok || !isObjectResp(objectResp) || objectResp["Object"] == nil {
+		t.Fatalf("node ObjectResp contract lost: %#v", response.Content)
 	}
 }
 
