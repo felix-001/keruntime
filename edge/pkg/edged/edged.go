@@ -359,7 +359,9 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 	klog.InfoS("Received pod list from MetaManager before kubelet SET",
 		"node", e.nodeName,
 		"databasePodCount", len(lists),
-		"setPodCount", len(pods),
+		"setPodCount", len(pods))
+	klog.V(4).InfoS("Pod list from MetaManager before kubelet SET",
+		"node", e.nodeName,
 		"setPods", klog.KObjs(pods))
 
 	updates := &kubelettypes.PodUpdate{Op: kubelettypes.SET, Pods: pods, Source: kubelettypes.ApiserverSource}

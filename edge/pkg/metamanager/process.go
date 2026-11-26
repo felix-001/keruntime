@@ -13,7 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2"
 
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
@@ -574,8 +573,17 @@ func processDeletePodDB(message model.Message) error {
 			}
 		}
 	}
-	if msgPod.UID == "" && message.GetSource() == modules.MetaManagerModuleName {
-		return fmt.Errorf("pod delete requires metadata.uid")
+	if msgPod.UID == "" {
+		if message.GetSource() == modules.MetaManagerModuleName {
+			return fmt.Errorf("pod delete requires metadata.uid")
+		}
+		// Preserve base semantics for legacy cloud deletes without metadata.uid:
+		// do not delete V1/meta_v2 records without UID confirmation so a recreated
+		// same-name Pod cannot be removed, while still allowing processDelete to
+		// refresh edged and ACK cloud.
+		klog.Warningf("Skipping pod metadata deletion because message UID is empty, resource: %s, messageID: %s",
+			message.GetResource(), message.GetID())
+		return nil
 	}
 	podDBList, err := dao.QueryMeta("key", message.GetResource())
 	if err != nil {
@@ -590,11 +598,7 @@ func processDeletePodDB(message model.Message) error {
 		if err := json.Unmarshal([]byte(podList[0]), &podDB); err != nil {
 			return err
 		}
-		if msgPod.UID == "" {
-			klog.Warningf("Pod delete message has empty UID, falling back to key-only deletion, resource: %s, storedPodUID: %s, messageID: %s",
-				message.GetResource(), podDB.UID, message.GetID())
-			msgPod.UID = podDB.UID
-		} else if podDB.UID != msgPod.UID {
+		if podDB.UID != msgPod.UID {
 			klog.Warningf("Skipping pod metadata deletion because UID does not match, resource: %s, storedPodUID: %s, messagePodUID: %s, messageID: %s",
 				message.GetResource(), podDB.UID, msgPod.UID, message.GetID())
 			// The V1 record belongs to a newer pod, so keep it, but meta_v2 may
@@ -604,21 +608,8 @@ func processDeletePodDB(message model.Message) error {
 			return deletePodV2(msgPod)
 		}
 	}
-	if msgPod.UID != "" {
-		if err := deletePodV2(msgPod); err != nil {
-			return err
-		}
-	} else if msgPod.Namespace != "" && msgPod.Name != "" {
-		klog.Warningf("Pod delete message has empty UID and no V1 record, deleting meta_v2 by key, resource: %s, messageID: %s",
-			message.GetResource(), message.GetID())
-		obj := &unstructured.Unstructured{}
-		obj.SetAPIVersion("v1")
-		obj.SetKind("Pod")
-		obj.SetNamespace(msgPod.Namespace)
-		obj.SetName(msgPod.Name)
-		if err := imitator.DefaultV2Client.DeleteObj(context.TODO(), obj); err != nil {
-			return err
-		}
+	if err := deletePodV2(msgPod); err != nil {
+		return err
 	}
 
 	podPatchKey := strings.Replace(message.GetResource(),

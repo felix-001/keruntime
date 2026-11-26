@@ -1125,7 +1125,8 @@ func TestPodCleanupDB(t *testing.T) {
 		wantError     bool
 	}{
 		{name: "missing UID from local cleanup", source: modules.MetaManagerModuleName, body: &v1.Pod{}, wantError: true},
-		{name: "legacy cloud delete without UID", body: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default"}}, stored: `{"metadata":{"uid":"old"}}`},
+		{name: "legacy cloud delete without UID keeps stored pod", body: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default"}}, stored: `{"metadata":{"uid":"new"}}`, v2Stored: `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod","namespace":"default","uid":"new"}}`},
+		{name: "legacy cloud delete without UID no stored pod", body: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default"}}},
 		{name: "bad content", body: "{", wantError: true},
 		{name: "marshal error", body: make(chan int), wantError: true},
 		{name: "query failure", queryError: true, wantError: true},
@@ -1191,8 +1192,10 @@ func TestPodCleanupDB(t *testing.T) {
 			if (err != nil) != test.wantError {
 				t.Fatalf("err=%v", err)
 			}
-			if test.name == "different UID" && deleted != 0 {
-				t.Fatal("new UID deleted")
+			if (test.name == "different UID" ||
+				test.name == "legacy cloud delete without UID keeps stored pod" ||
+				test.name == "legacy cloud delete without UID no stored pod") && deleted != 0 {
+				t.Fatalf("unexpected DB delete count = %d for %s", deleted, test.name)
 			}
 		})
 	}
