@@ -46,9 +46,11 @@ import (
 	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	metaManagerConfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
 	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/watchhook"
 	"github.com/kubeedge/kubeedge/pkg/apis/componentconfig/edgecore/v1alpha2"
 	metaconfig "github.com/kubeedge/kubeedge/pkg/apis/componentconfig/meta/v1alpha1"
@@ -218,17 +220,24 @@ func TestProcessRemoteResponseBranches(t *testing.T) {
 	})
 
 	for _, test := range []struct {
-		name    string
-		content interface{}
+		name      string
+		content   interface{}
+		sendErr   error
+		wantCloud bool
 	}{
-		{name: "success", content: constants.MessageSuccessfulContent},
-		{name: "error", content: errors.New("remote error")},
+		{name: "success", content: constants.MessageSuccessfulContent, wantCloud: true},
+		{name: "quic ok bytes", content: []byte(constants.MessageSuccessfulContent), wantCloud: true},
+		{name: "error", content: errors.New("remote error"), wantCloud: true},
 		{name: "invalid json", content: []byte("{")},
+		{name: "sendSync error", sendErr: errors.New("timeout")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			manager.syncTransport = func(module string, message model.Message, _ time.Duration) (model.Message, error) {
 				if module != string(metaManagerConfig.Config.ContextSendModule) {
 					return model.Message{}, fmt.Errorf("unexpected destination %q", module)
+				}
+				if test.sendErr != nil {
+					return model.Message{}, test.sendErr
 				}
 				return *message.NewRespByMessage(&message, test.content), nil
 			}
@@ -240,13 +249,16 @@ func TestProcessRemoteResponseBranches(t *testing.T) {
 			if err != nil {
 				t.Fatalf("receive response: %v", err)
 			}
-			if test.name != "invalid json" && response.GetParentID() != request.GetID() {
+			if response.GetParentID() != request.GetID() {
 				t.Fatalf("response parent ID = %q, want %q", response.GetParentID(), request.GetID())
 			}
-			if test.name == "invalid json" && response.GetContent() == nil {
-				t.Fatal("invalid JSON response did not produce an error")
+			if !test.wantCloud && response.GetContent() == nil {
+				t.Fatal("error branch did not produce an error response")
 			}
-			if test.name != "invalid json" {
+			if test.name == "quic ok bytes" && response.GetContent() != constants.MessageSuccessfulContent {
+				t.Fatalf("quic ok content = %#v, want %q", response.GetContent(), constants.MessageSuccessfulContent)
+			}
+			if test.wantCloud {
 				_, err = beehiveContext.Receive(ModuleNameEdgeHub)
 				if err != nil {
 					t.Fatalf("receive cloud response: %v", err)
@@ -333,9 +345,9 @@ func TestAttachPodDeleteSnapshotBranches(t *testing.T) {
 				ormer := beego.NewMockOrmer(mockCtrl)
 				query := beego.NewMockQuerySeter(mockCtrl)
 				dbm.DBAccess = ormer
-				ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(podSnapshotQueryRetries)
-				query.EXPECT().Filter("type", model.ResourceTypePod).Return(query).Times(podSnapshotQueryRetries)
-				query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(podSnapshotQueryRetries)
+				ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(1)
+				query.EXPECT().Filter("type", model.ResourceTypePod).Return(query).Times(1)
+				query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(1)
 			}
 			message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
 				"default/pod/pod", model.DeleteOperation).FillBody(test.body)
@@ -454,9 +466,9 @@ func TestProcessPodDeleteSnapshotRetryFailureReschedules(t *testing.T) {
 	ormer := beego.NewMockOrmer(mockCtrl)
 	query := beego.NewMockQuerySeter(mockCtrl)
 	dbm.DBAccess = ormer
-	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(podSnapshotQueryRetries)
-	query.EXPECT().Filter("type", model.ResourceTypePod).Return(query).Times(podSnapshotQueryRetries)
-	query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(podSnapshotQueryRetries)
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(1)
+	query.EXPECT().Filter("type", model.ResourceTypePod).Return(query).Times(1)
+	query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(1)
 
 	manager := newMetaManager(true)
 	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: manager.Name(), ModuleType: common.MsgCtxTypeChannel})
@@ -1209,6 +1221,7 @@ func TestProcessDeleteUIDMismatchIsIdempotent(t *testing.T) {
 }
 
 func TestProcessPodPatchResponse(t *testing.T) {
+	connect.SetConnected(true)
 	manager := newMetaManager(true)
 	for _, name := range []string{ModuleNameEdgeHub, ModuleNameEdged, manager.Name()} {
 		name := name
@@ -1266,7 +1279,11 @@ func TestProcessPodPatchResponse(t *testing.T) {
 					"Object": map[string]interface{}{"metadata": map[string]interface{}{"uid": "old-uid"}}, "Err": nil,
 				})
 				if notFound {
-					response.Content = map[string]interface{}{"Object": nil, "Err": map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(404)}}}
+					notFoundErr := apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "old-pod")
+					rawErr, _ := json.Marshal(map[string]interface{}{"ErrStatus": notFoundErr.ErrStatus})
+					var decodedErr map[string]interface{}
+					_ = json.Unmarshal(rawErr, &decodedErr)
+					response.Content = map[string]interface{}{"Object": nil, "Err": decodedErr}
 				}
 				cloudResult <- cloudRequest
 				return *response, nil
@@ -1323,21 +1340,102 @@ func TestProcessPodPatchResponse(t *testing.T) {
 			if !ok || !isObjectResp(body) || (body["Err"] != nil) != notFound {
 				t.Fatalf("ObjectResp contract lost: %+v", response)
 			}
-			receive(ModuleNameEdgeHub)
+			// podpatch must not send a redundant OK ACK back to cloud.
+			unexpectedAck := make(chan model.Message, 1)
+			go func() {
+				if msg, err := beehiveContext.Receive(ModuleNameEdgeHub); err == nil {
+					unexpectedAck <- msg
+				}
+			}()
+			select {
+			case msg := <-unexpectedAck:
+				t.Fatalf("unexpected cloud ACK for podpatch: %+v", msg)
+			case <-time.After(30 * time.Millisecond):
+			}
 		})
 	}
 }
 
+func TestProcessPodPatchOfflineFastFail(t *testing.T) {
+	previousConnected := connect.IsConnected()
+	connect.SetConnected(false)
+	defer connect.SetConnected(previousConnected)
+
+	manager := newMetaManager(true)
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdged, ModuleType: common.MsgCtxTypeChannel})
+	t.Cleanup(func() { beehiveContext.Cleanup(ModuleNameEdged) })
+
+	request := model.NewMessage("").BuildRouter(modules.EdgedModuleName, modules.MetaGroup,
+		"default/podpatch/old-pod", model.PatchOperation).FillBody(`{"metadata":{"uid":"old-uid"}}`)
+	request.Header.Sync = false
+	if done := manager.processPatch(*request); done != nil {
+		t.Fatal("offline podpatch should not start processRemote")
+	}
+	response, err := beehiveContext.Receive(ModuleNameEdged)
+	if err != nil {
+		t.Fatalf("receive offline error response: %v", err)
+	}
+	if response.GetParentID() != request.GetID() {
+		t.Fatalf("response parent ID = %q, want %q", response.GetParentID(), request.GetID())
+	}
+	podResp, ok := response.GetContent().(client.PodResp)
+	if !ok || !apierrors.IsServiceUnavailable(&podResp.Err) {
+		t.Fatalf("expected ServiceUnavailable PodResp, got %#v", response.GetContent())
+	}
+}
+
 func TestIsPodPatchNotFound(t *testing.T) {
-	status404 := map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(404)}}
+	realNotFound := map[string]interface{}{
+		"ErrStatus": map[string]interface{}{
+			"code":   float64(404),
+			"reason": string(metav1.StatusReasonNotFound),
+			"details": map[string]interface{}{
+				"kind": "pods",
+				"name": "pod",
+			},
+		},
+	}
+	missingReason404 := map[string]interface{}{
+		"ErrStatus": map[string]interface{}{
+			"code": float64(404),
+			"details": map[string]interface{}{
+				"kind": "pods",
+				"name": "pod",
+			},
+		},
+	}
+	wrongKind404 := map[string]interface{}{
+		"ErrStatus": map[string]interface{}{
+			"code":   float64(404),
+			"reason": string(metav1.StatusReasonNotFound),
+			"details": map[string]interface{}{
+				"kind": "configmaps",
+				"name": "pod",
+			},
+		},
+	}
+	wrongName404 := map[string]interface{}{
+		"ErrStatus": map[string]interface{}{
+			"code":   float64(404),
+			"reason": string(metav1.StatusReasonNotFound),
+			"details": map[string]interface{}{
+				"kind": "pods",
+				"name": "other-pod",
+			},
+		},
+	}
 	for _, test := range []struct {
 		name     string
 		resource string
 		err      interface{}
 		want     bool
 	}{
-		{name: "pod patch 404", resource: "default/podpatch/pod", err: status404, want: true},
-		{name: "pod 404", resource: "default/pod/pod", err: status404},
+		{name: "pod patch 404", resource: "default/podpatch/pod", err: realNotFound, want: true},
+		{name: "pod 404", resource: "default/pod/pod", err: realNotFound},
+		{name: "missing reason 404", resource: "default/podpatch/pod", err: missingReason404},
+		{name: "wrong kind 404", resource: "default/podpatch/pod", err: wrongKind404},
+		{name: "wrong name 404", resource: "default/podpatch/pod", err: wrongName404},
+		{name: "bare code 404", resource: "default/podpatch/pod", err: map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(404)}}},
 		{name: "forbidden", resource: "default/podpatch/pod", err: map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(403)}}},
 		{name: "conflict", resource: "default/podpatch/pod", err: map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(409)}}},
 		{name: "plain error", resource: "default/podpatch/pod", err: "not found"},
@@ -1363,9 +1461,15 @@ func TestPodPatchErrorEvidence(t *testing.T) {
 		wantUIDMismatch bool
 	}{
 		{name: "real not found", err: apierrors.NewNotFound(resource, "pod"), wantNotFound: true},
+		{name: "wrong pod not found", err: apierrors.NewNotFound(resource, "other")},
+		{name: "wrong group not found", err: apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "pods"}, "pod")},
 		{name: "proxy not found", err: apierrors.NewGenericServerResponse(404, "PATCH", resource, "pod", "proxy", 0, true)},
 		{name: "uid mismatch", err: apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "pod",
 			field.ErrorList{field.Invalid(field.NewPath("metadata", "uid"), "old", "uid changed")}), wantUIDMismatch: true},
+		{name: "uid mismatch wrong name", err: apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "other",
+			field.ErrorList{field.Invalid(field.NewPath("metadata", "uid"), "old", "uid changed")})},
+		{name: "uid mismatch wrong kind", err: apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, "pod",
+			field.ErrorList{field.Invalid(field.NewPath("metadata", "uid"), "old", "uid changed")})},
 		{name: "generic conflict", err: apierrors.NewConflict(resource, "pod", fmt.Errorf("conflict"))},
 	}
 	for _, test := range tests {
@@ -1420,7 +1524,8 @@ func TestDeleteMissingPodBuildsNamedDelete(t *testing.T) {
 		t.Fatalf("unexpected delete route: %+v", deleteMessage.Router)
 	}
 	pod, ok := deleteMessage.GetContent().(*v1.Pod)
-	if !ok || pod == nil || pod.Namespace != "default" || pod.Name != "old-pod" || pod.UID != "old-uid" {
+	if !ok || pod == nil || pod.APIVersion != "v1" || pod.Kind != "Pod" ||
+		pod.Namespace != "default" || pod.Name != "old-pod" || pod.UID != "old-uid" {
 		t.Fatalf("unexpected delete body: %T %+v", deleteMessage.GetContent(), deleteMessage.GetContent())
 	}
 }
@@ -1434,12 +1539,8 @@ func TestPodDeleteSnapshotRetry(t *testing.T) {
 	defer func() { podDeleteSnapshotRetryBackoff = previousBackoff }()
 	podDeleteSnapshotRetryBackoff = 0
 	ormer := beego.NewMockOrmer(mockCtrl)
-	query := beego.NewMockQuerySeter(mockCtrl)
 	snapshot := beego.NewMockQuerySeter(mockCtrl)
 	dbm.DBAccess = ormer
-	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).Times(1)
-	query.EXPECT().Filter("type", model.ResourceTypePod).Return(query)
-	query.EXPECT().All(gomock.Any()).Return(int64(0), errFailedDBOperation).Times(1)
 
 	manager := newMetaManager(true)
 	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: manager.Name(), ModuleType: common.MsgCtxTypeChannel})
@@ -1544,7 +1645,7 @@ func TestProcessDeletePodWithoutV2RecordTriggersWatch(t *testing.T) {
 	defer hook.Stop()
 
 	pod := &v1.Pod{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+		// Deliberately omit TypeMeta to verify fallback populates apiVersion/kind.
 		ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default", UID: "uid", ResourceVersion: "300"},
 		Spec:       v1.PodSpec{NodeName: "edge"},
 	}
@@ -1559,11 +1660,71 @@ func TestProcessDeletePodWithoutV2RecordTriggersWatch(t *testing.T) {
 			t.Fatalf("event type = %s, want Deleted", event.Type)
 		}
 		object, ok := event.Object.(*unstructured.Unstructured)
-		if !ok || object.GetUID() != pod.GetUID() {
+		if !ok || object.GetUID() != pod.GetUID() || object.GetAPIVersion() != "v1" || object.GetKind() != "Pod" {
 			t.Fatalf("unexpected deleted object: %#v", event.Object)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("missing deleted watch event")
+	}
+}
+
+func TestProcessDeletePodLocalCleanupDeliversToListThenWatchClient(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	previousRev := imitator.DefaultV2Client.GetRevision()
+	defer imitator.DefaultV2Client.SetRevision(previousRev)
+
+	imitator.DefaultV2Client.SetRevision(uint64(200))
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().All(gomock.Any()).DoAndReturn(func(target interface{}, _ ...string) (int64, error) {
+		switch result := target.(type) {
+		case *[]dao.Meta:
+			*result = []dao.Meta{{Value: `{"metadata":{"name":"pod","namespace":"default","uid":"old"}}`}}
+		case *[]v2.MetaV2:
+			*result = []v2.MetaV2{{
+				Key:             "/core/v1/pods/default/pod",
+				ResourceVersion: 150,
+				Value:           `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod","namespace":"default","uid":"old","resourceVersion":"150"}}`,
+			}}
+		}
+		return 1, nil
+	}).AnyTimes()
+	query.EXPECT().Delete().Return(int64(1), nil).Times(3)
+
+	// Simulate watcher.go starting Watch from initialRev + 1 (201) after listing from revision 200.
+	events := make(chan watch.Event, 1)
+	hook, err := watchhook.NewWatchHook("/core/v1/pods/default", 201, watchhook.NewChanReceiver(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hook.Stop()
+
+	// Local cleanup pod has empty ResourceVersion.
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default", UID: "old"},
+	}
+	message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup,
+		"default/pod/pod", model.DeleteOperation).FillBody(pod)
+	if err := processDeletePodDB(*message); err != nil {
+		t.Fatalf("processDeletePodDB: %v", err)
+	}
+	select {
+	case event := <-events:
+		if event.Type != watch.Deleted {
+			t.Fatalf("event type = %s, want Deleted", event.Type)
+		}
+		object, ok := event.Object.(*unstructured.Unstructured)
+		if !ok || object.GetUID() != "old" {
+			t.Fatalf("unexpected deleted object: %#v", event.Object)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("list-then-watch client missed local cleanup Deleted event")
 	}
 }
 
@@ -1604,6 +1765,9 @@ func TestProcessRemoteNodeCreatePreservesObjectResp(t *testing.T) {
 	objectResp, ok := response.Content.(map[string]interface{})
 	if !ok || !isObjectResp(objectResp) || objectResp["Object"] == nil {
 		t.Fatalf("node ObjectResp contract lost: %#v", response.Content)
+	}
+	if _, err := beehiveContext.Receive(ModuleNameEdgeHub); err != nil {
+		t.Fatalf("receive cloud ack: %v", err)
 	}
 }
 

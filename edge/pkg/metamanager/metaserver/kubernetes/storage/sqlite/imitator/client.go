@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -27,6 +28,7 @@ type Client interface {
 	Inject(msg model.Message)
 	InsertOrUpdateObj(ctx context.Context, obj runtime.Object) error
 	DeleteObj(ctx context.Context, obj runtime.Object) error
+	DeletePodByUID(ctx context.Context, pod corev1.Pod) error
 
 	GetRevision() uint64
 	SetRevision(version interface{})

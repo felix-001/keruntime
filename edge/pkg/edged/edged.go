@@ -36,8 +36,6 @@ import (
 	"github.com/golang/protobuf/jsonpb"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/klog/v2"
@@ -214,6 +212,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 		_, resType, resID, err := util.ParseResourceEdge(result.GetResource(), result.GetOperation())
 		if err != nil {
 			klog.Errorf("failed to parse the Resource: %v", err)
+			sendSyncDeleteError(result, err)
 			continue
 		}
 		op := result.GetOperation()
@@ -221,6 +220,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 		content, err := result.GetContentData()
 		if err != nil {
 			klog.Errorf("get message content data failed: %v", err)
+			sendSyncDeleteError(result, err)
 			continue
 		}
 
@@ -255,6 +255,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 				}
 				if err != nil {
 					klog.Errorf("handle pod failed: %v", err)
+					sendSyncDeleteError(result, err)
 					continue
 				}
 				if op == model.DeleteOperation && result.IsSync() {
@@ -367,6 +368,25 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 	return nil
 }
 
+var (
+	restoredPodVerifyInitialBackoff      = 5 * time.Second
+	restoredPodVerifyMaxBackoff          = 60 * time.Second
+	restoredPodVerifyDisconnectedBackoff = 5 * time.Second
+	restoredPodVerifyMaxAttempts         = 10
+)
+
+func sendSyncDeleteError(result model.Message, err error) {
+	if result.GetOperation() != model.DeleteOperation || !result.IsSync() {
+		return
+	}
+	errResp := model.NewMessage(result.GetID()).
+		SetRoute(modules.EdgedModuleName, result.GetGroup()).
+		SetResourceOperation(result.GetResource(), model.ResponseErrorOperation).
+		SetType(result.GetType()).
+		FillBody(err.Error())
+	beehiveContext.SendResp(*errResp)
+}
+
 func (e *edged) verifyRestoredPods(content []byte) {
 	var lists []string
 	if err := json.Unmarshal(content, &lists); err != nil {
@@ -386,27 +406,123 @@ func (e *edged) verifyRestoredPods(content []byte) {
 		pending = append(pending, pod)
 	}
 	client := metaclient.New()
-	stop := beehiveContext.Done()
-	_ = wait.PollImmediateUntil(5*time.Second, func() (bool, error) {
+	verifyRestoredPodsLoop(
+		pending,
+		beehiveContext.Done(),
+		connect.IsConnected,
+		func(namespace, name string) (*v1.Pod, error) {
+			return client.Pods(namespace).Get(name)
+		},
+		func(namespace, name string, patch []byte) (*v1.Pod, error) {
+			return client.Pods(namespace).Patch(name, patch)
+		},
+	)
+}
+
+func verifyRestoredPodsLoop(
+	pending []v1.Pod,
+	stop <-chan struct{},
+	isConnected func() bool,
+	getLocalPod func(namespace, name string) (*v1.Pod, error),
+	patchPod func(namespace, name string, patch []byte) (*v1.Pod, error),
+) {
+	if len(pending) == 0 {
+		return
+	}
+	backoff := restoredPodVerifyInitialBackoff
+	attempts := 0
+	for len(pending) > 0 {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if !isConnected() {
+			if !waitWithStop(restoredPodVerifyDisconnectedBackoff, stop) {
+				return
+			}
+			continue
+		}
 		remaining := pending[:0]
+		disconnected := false
 		for index := range pending {
 			select {
 			case <-stop:
-				return true, nil
+				return
 			default:
 			}
-			if !connect.IsConnected() {
+			if !isConnected() {
 				remaining = append(remaining, pending[index:]...)
+				disconnected = true
 				break
 			}
 			pod := &pending[index]
-			if !verifyRestoredPod(pod, client.Pods(pod.Namespace).Patch) {
+			if isRestoredPodGoneLocally(pod, getLocalPod) {
+				klog.InfoS("Skipping restored pod verification because local pod is already gone or replaced", "pod", klog.KObj(pod), "podUID", pod.UID)
+				continue
+			}
+			if !verifyRestoredPod(pod, func(name string, patch []byte) (*v1.Pod, error) {
+				return patchPod(pod.Namespace, name, patch)
+			}) {
 				remaining = append(remaining, *pod)
 			}
 		}
 		pending = remaining
-		return len(pending) == 0, nil
-	}, stop)
+		if len(pending) == 0 {
+			return
+		}
+		if disconnected {
+			if !waitWithStop(restoredPodVerifyDisconnectedBackoff, stop) {
+				return
+			}
+			continue
+		}
+		attempts++
+		if restoredPodVerifyMaxAttempts > 0 && attempts >= restoredPodVerifyMaxAttempts {
+			klog.Warningf("Stopping restored pod verification after %d failed attempts with %d pods remaining", attempts, len(pending))
+			return
+		}
+		if !waitWithStop(backoff, stop) {
+			return
+		}
+		backoff *= 2
+		if restoredPodVerifyMaxBackoff > 0 && backoff > restoredPodVerifyMaxBackoff {
+			backoff = restoredPodVerifyMaxBackoff
+		}
+	}
+}
+
+func waitWithStop(delay time.Duration, stop <-chan struct{}) bool {
+	if delay <= 0 {
+		select {
+		case <-stop:
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func isRestoredPodGoneLocally(pod *v1.Pod, getLocalPod func(namespace, name string) (*v1.Pod, error)) bool {
+	if getLocalPod == nil {
+		return false
+	}
+	localPod, err := getLocalPod(pod.Namespace, pod.Name)
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	if err == nil && localPod != nil && localPod.UID != pod.UID {
+		return true
+	}
+	return false
 }
 
 func verifyRestoredPod(pod *v1.Pod, patchPod func(string, []byte) (*v1.Pod, error)) bool {
@@ -416,36 +532,16 @@ func verifyRestoredPod(pod *v1.Pod, patchPod func(string, []byte) (*v1.Pod, erro
 	}
 	klog.InfoS("Verifying restored pod with UID-only PATCH", "pod", klog.KObj(pod), "podUID", pod.UID)
 	_, err = patchPod(pod.Name, patch)
-	if err == nil || (apierrors.IsNotFound(err) && !isUnexpectedServerResponse(err)) {
+	if err == nil {
 		return true
 	}
+	if statusErr, ok := err.(*apierrors.StatusError); ok {
+		if metamanager.IsPodPatchNotFoundStatus(&statusErr.ErrStatus, pod.Name) ||
+			metamanager.IsPodPatchUIDMismatchStatus(&statusErr.ErrStatus, pod.Name) {
+			return true
+		}
+	}
 	klog.ErrorS(err, "Restored pod verification failed", "pod", klog.KObj(pod), "podUID", pod.UID)
-	return isPodUIDMismatchError(err)
-}
-
-func isUnexpectedServerResponse(err error) bool {
-	statusErr, ok := err.(*apierrors.StatusError)
-	if !ok || statusErr.ErrStatus.Details == nil {
-		return false
-	}
-	for _, cause := range statusErr.ErrStatus.Details.Causes {
-		if cause.Type == metav1.CauseTypeUnexpectedServerResponse {
-			return true
-		}
-	}
-	return false
-}
-
-func isPodUIDMismatchError(err error) bool {
-	statusErr, ok := err.(*apierrors.StatusError)
-	if !ok || statusErr.ErrStatus.Reason != metav1.StatusReasonInvalid || statusErr.ErrStatus.Details == nil {
-		return false
-	}
-	for _, cause := range statusErr.ErrStatus.Details.Causes {
-		if cause.Field == "metadata.uid" {
-			return true
-		}
-	}
 	return false
 }
 

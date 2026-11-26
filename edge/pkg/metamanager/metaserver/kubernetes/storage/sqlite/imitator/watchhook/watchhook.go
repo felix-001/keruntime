@@ -18,8 +18,9 @@ type WatchHook struct {
 	ResourceVersion uint64
 	id              string
 	Receiver
-	observedUID string
-	lock        sync.Mutex
+	observedUIDs map[string]string
+	stopped      bool
+	lock         sync.Mutex
 }
 
 func NewWatchHook(key string, rev uint64, receiver Receiver) (*WatchHook, error) {
@@ -32,6 +33,7 @@ func NewWatchHook(key string, rev uint64, receiver Receiver) (*WatchHook, error)
 		Name:            name,
 		ResourceVersion: rev,
 		Receiver:        receiver,
+		observedUIDs:    make(map[string]string),
 	}
 	err := AddHook(wh)
 	return wh, err
@@ -40,6 +42,9 @@ func NewWatchHook(key string, rev uint64, receiver Receiver) (*WatchHook, error)
 func (h *WatchHook) Do(event watch.Event) error {
 	h.Lock()
 	defer h.UnLock()
+	if h.stopped {
+		return nil
+	}
 	return h.Receive(event)
 }
 
@@ -58,21 +63,34 @@ func (h *WatchHook) GetResourceVersion() uint64 {
 	return h.ResourceVersion
 }
 
-func (h *WatchHook) GetObservedUID() string {
+func (h *WatchHook) GetObservedUID(key string) string {
 	h.lock.Lock()
 	defer h.lock.Unlock()
-	return h.observedUID
+	return h.observedUIDs[key]
 }
 
-func (h *WatchHook) SetObservedUID(uid string) {
+func (h *WatchHook) SetObservedUID(key, uid string) {
 	h.lock.Lock()
-	h.observedUID = uid
+	if h.observedUIDs == nil {
+		h.observedUIDs = make(map[string]string)
+	}
+	h.observedUIDs[key] = uid
+	h.lock.Unlock()
+}
+
+func (h *WatchHook) DeleteObservedUID(key string) {
+	h.lock.Lock()
+	delete(h.observedUIDs, key)
 	h.lock.Unlock()
 }
 
 func (h *WatchHook) Stop() {
 	h.Lock()
 	defer h.UnLock()
+	if h.stopped {
+		return
+	}
+	h.stopped = true
 	if err := DeleteHook(h.id); err != nil {
 		klog.Error(err)
 	}

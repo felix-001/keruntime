@@ -21,10 +21,11 @@ import (
 )
 
 type metaManager struct {
-	enable              bool
-	syncTransport       func(string, model.Message, time.Duration) (model.Message, error)
-	podSnapshotRetryMu  sync.Mutex
-	podSnapshotRetrySet bool
+	enable                bool
+	syncTransport         func(string, model.Message, time.Duration) (model.Message, error)
+	podSnapshotRetryMu    sync.Mutex
+	podSnapshotRetrySet   bool
+	podSnapshotRetryDelay time.Duration
 }
 
 var _ core.Module = (*metaManager)(nil)

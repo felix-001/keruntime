@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -12,6 +13,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
+
+	"github.com/kubeedge/beehive/pkg/common"
+	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
+	"github.com/kubeedge/beehive/pkg/core/model"
+	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 )
 
 func TestVerifyRestoredPod(t *testing.T) {
@@ -23,12 +29,15 @@ func TestVerifyRestoredPod(t *testing.T) {
 	}{
 		{"success", nil, true},
 		{"missing", apierrors.NewNotFound(resource, "old"), true},
+		{"wrong name not found", apierrors.NewNotFound(resource, "other"), false},
+		{"wrong resource not found", apierrors.NewNotFound(schema.GroupResource{Resource: "configmaps"}, "old"), false},
 		{"forbidden", apierrors.NewForbidden(resource, "old", fmt.Errorf("denied")), false},
 		{"unauthorized", apierrors.NewUnauthorized("denied"), false},
 		{"conflict", apierrors.NewConflict(resource, "old", fmt.Errorf("conflict")), false},
 		{"bad request", apierrors.NewBadRequest("invalid"), false},
 		{"invalid", apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "old", nil), false},
 		{"uid mismatch", apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "old", field.ErrorList{field.Invalid(field.NewPath("metadata", "uid"), "old", "uid changed")}), true},
+		{"uid mismatch wrong name", apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, "other", field.ErrorList{field.Invalid(field.NewPath("metadata", "uid"), "old", "uid changed")}), false},
 		{"unexpected 404", apierrors.NewGenericServerResponse(404, "PATCH", resource, "old", "proxy", 0, true), false},
 		{"server error", apierrors.NewInternalError(fmt.Errorf("unavailable")), false},
 		{"timeout", apierrors.NewTimeoutError("timeout", 1), false},
@@ -48,6 +57,94 @@ func TestVerifyRestoredPod(t *testing.T) {
 				t.Fatalf("called=%v complete=%v", called, complete)
 			}
 		})
+	}
+}
+
+func TestVerifyRestoredPodsLoopBackoffAndMaxAttempts(t *testing.T) {
+	prevInitial := restoredPodVerifyInitialBackoff
+	prevMax := restoredPodVerifyMaxBackoff
+	prevMaxAttempts := restoredPodVerifyMaxAttempts
+	defer func() {
+		restoredPodVerifyInitialBackoff = prevInitial
+		restoredPodVerifyMaxBackoff = prevMax
+		restoredPodVerifyMaxAttempts = prevMaxAttempts
+	}()
+	restoredPodVerifyInitialBackoff = time.Millisecond
+	restoredPodVerifyMaxBackoff = 4 * time.Millisecond
+	restoredPodVerifyMaxAttempts = 3
+
+	pod := v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: "default", UID: "old-uid"}}
+	stop := make(chan struct{})
+	defer close(stop)
+	attempts := 0
+	verifyRestoredPodsLoop(
+		[]v1.Pod{pod},
+		stop,
+		func() bool { return true },
+		func(namespace, name string) (*v1.Pod, error) {
+			return &pod, nil
+		},
+		func(namespace, name string, patch []byte) (*v1.Pod, error) {
+			attempts++
+			return nil, apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, name, fmt.Errorf("denied"))
+		},
+	)
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestVerifyRestoredPodsLoopSkipsGoneOrReplacedLocalPod(t *testing.T) {
+	prevInitial := restoredPodVerifyInitialBackoff
+	defer func() { restoredPodVerifyInitialBackoff = prevInitial }()
+	restoredPodVerifyInitialBackoff = time.Millisecond
+
+	gonePod := v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "gone", Namespace: "default", UID: "old-1"}}
+	replacedPod := v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replaced", Namespace: "default", UID: "old-2"}}
+	stop := make(chan struct{})
+	defer close(stop)
+	patchCalled := 0
+	verifyRestoredPodsLoop(
+		[]v1.Pod{gonePod, replacedPod},
+		stop,
+		func() bool { return true },
+		func(namespace, name string) (*v1.Pod, error) {
+			if name == "gone" {
+				return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pod"}, name)
+			}
+			return &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: "new-2"}}, nil
+		},
+		func(namespace, name string, patch []byte) (*v1.Pod, error) {
+			patchCalled++
+			return nil, nil
+		},
+	)
+	if patchCalled != 0 {
+		t.Fatalf("patchCalled = %d, want 0 for gone/replaced local pods", patchCalled)
+	}
+}
+
+func TestSendSyncDeleteErrorRespondsImmediately(t *testing.T) {
+	beehiveContext.InitContext([]string{common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: modules.EdgedModuleName, ModuleType: common.MsgCtxTypeChannel})
+	t.Cleanup(func() { beehiveContext.Cleanup(modules.EdgedModuleName) })
+
+	go func() {
+		msg, err := beehiveContext.Receive(modules.EdgedModuleName)
+		if err != nil {
+			return
+		}
+		sendSyncDeleteError(msg, fmt.Errorf("decode failed"))
+	}()
+
+	req := model.NewMessage("").BuildRouter(modules.MetaManagerModuleName, modules.MetaGroup,
+		"default/pod/old-pod", model.DeleteOperation).FillBody("{")
+	resp, err := beehiveContext.SendSync(modules.EdgedModuleName, *req, time.Second)
+	if err != nil {
+		t.Fatalf("SendSync failed: %v", err)
+	}
+	if resp.GetParentID() != req.GetID() || resp.GetOperation() != model.ResponseErrorOperation || resp.GetContent() != "decode failed" {
+		t.Fatalf("unexpected sync error response: %+v", resp)
 	}
 }
 

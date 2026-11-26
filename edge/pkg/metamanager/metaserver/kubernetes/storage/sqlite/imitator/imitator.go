@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -119,6 +120,102 @@ func (s *imitator) DeleteObj(ctx context.Context, obj runtime.Object) error {
 	}
 	err = s.Delete(context.TODO(), key)
 	return err
+}
+
+const maxDeletePodByUIDRetries = 3
+
+func (s *imitator) DeletePodByUID(ctx context.Context, pod corev1.Pod) error {
+	if pod.Namespace == "" || pod.Name == "" || pod.UID == "" {
+		return fmt.Errorf("pod delete requires namespace, name and metadata.uid")
+	}
+	key := fmt.Sprintf("/core/v1/pods/%s/%s", pod.Namespace, pod.Name)
+	var events []watch.Event
+
+	if err := func() error {
+		s.lock.Lock()
+		defer s.lock.Unlock()
+	retry:
+		for attempt := 0; attempt < maxDeletePodByUIDRetries; attempt++ {
+			events = events[:0]
+			eventSent := false
+			var records []v2.MetaV2
+			if _, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter("key", key).All(&records); err != nil {
+				return err
+			}
+			hasRecords := len(records) > 0
+			for _, record := range records {
+				var stored corev1.Pod
+				if err := json.Unmarshal([]byte(record.Value), &stored); err != nil {
+					return err
+				}
+				if stored.UID != pod.UID {
+					continue
+				}
+				deleted, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter("key", key).Filter("value", record.Value).Delete()
+				if err != nil {
+					return err
+				}
+				if deleted == 0 {
+					continue retry
+				}
+				eventSent = true
+				object := &unstructured.Unstructured{}
+				if err := json.Unmarshal([]byte(record.Value), &object.Object); err != nil {
+					return err
+				}
+				if object.GetAPIVersion() == "" {
+					object.SetAPIVersion("v1")
+				}
+				if object.GetKind() == "" {
+					object.SetKind("Pod")
+				}
+				if pod.ResourceVersion != "" {
+					object.SetResourceVersion(pod.ResourceVersion)
+					if rv, err := s.versioner.ParseResourceVersion(pod.ResourceVersion); err == nil && rv > s.revision {
+						s.revision = rv
+					}
+				} else {
+					// Watchers start from initialRev+1 and filter strictly with hookRV < eventRV.
+					deleteRV := s.revision + 2
+					if record.ResourceVersion+1 > deleteRV {
+						deleteRV = record.ResourceVersion + 1
+					}
+					if storedRV, err := s.versioner.ParseResourceVersion(object.GetResourceVersion()); err == nil && storedRV+1 > deleteRV {
+						deleteRV = storedRV + 1
+					}
+					object.SetResourceVersion(strconv.FormatUint(deleteRV, 10))
+				}
+				events = append(events, watch.Event{Type: watch.Deleted, Object: object})
+			}
+			if !eventSent && !hasRecords {
+				podCopy := pod
+				if podCopy.APIVersion == "" {
+					podCopy.APIVersion = "v1"
+				}
+				if podCopy.Kind == "" {
+					podCopy.Kind = "Pod"
+				}
+				data, err := json.Marshal(&podCopy)
+				if err != nil {
+					return err
+				}
+				object := &unstructured.Unstructured{}
+				if err := json.Unmarshal(data, &object.Object); err != nil {
+					return err
+				}
+				events = append(events, watch.Event{Type: watch.Deleted, Object: object})
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to delete pod %s from meta_v2 after %d retries", key, maxDeletePodByUIDRetries)
+	}(); err != nil {
+		return err
+	}
+
+	for _, event := range events {
+		watchhook.TriggerPodDeletion(event)
+	}
+	return nil
 }
 func (s *imitator) Get(ctx context.Context, key string) (Resp, error) {
 	var resp Resp

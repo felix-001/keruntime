@@ -1,8 +1,10 @@
 package metamanager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"time"
@@ -11,8 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/klog/v2"
 
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
@@ -21,15 +21,12 @@ import (
 	edgecontrollerConstants "github.com/kubeedge/kubeedge/cloud/pkg/edgecontroller/constants"
 	"github.com/kubeedge/kubeedge/common/constants"
 	connect "github.com/kubeedge/kubeedge/edge/pkg/common/cloudconnection"
-	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
 	edgeCommonMessage "github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	metaManagerConfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
-	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator"
-	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/watchhook"
 )
 
 // Constants to check metamanager processes
@@ -43,12 +40,14 @@ const (
 type PodDeleteSnapshot []string
 
 const (
-	podSnapshotQueryRetries   = 3
-	podSnapshotQueryBackoff   = time.Second
 	podSnapshotRetryOperation = "pod-snapshot-retry"
 )
 
-var podDeleteSnapshotRetryBackoff = time.Second
+var (
+	podDeleteSnapshotRetryBackoff    = time.Second
+	podDeleteSnapshotRetryMaxBackoff = 30 * time.Second
+	podLocalCleanupTimeout           = 10 * time.Second
+)
 
 func feedbackError(err error, request model.Message) {
 	errResponse := model.NewErrorMessage(&request, err.Error()).SetRoute(modules.MetaManagerModuleName, request.GetGroup())
@@ -59,9 +58,43 @@ func feedbackError(err error, request model.Message) {
 	}
 }
 
+func feedbackRemoteError(err error, request model.Message, parentID string) {
+	if parentID == "" {
+		parentID = request.GetID()
+	}
+	if request.GetSource() == modules.EdgedModuleName {
+		_, resType, _, _, _ := parseResource(&request)
+		if resType == model.ResourceTypePodPatch {
+			statusErr := apierrors.NewInternalError(err)
+			if strings.Contains(err.Error(), errNotConnected) {
+				statusErr = apierrors.NewServiceUnavailable(err.Error())
+			}
+			resp := model.NewMessage(parentID).
+				SetRoute(modules.MetaManagerModuleName, request.GetGroup()).
+				SetResourceOperation(request.GetResource(), model.ResponseOperation).
+				SetType(request.GetType()).
+				FillBody(client.PodResp{Err: *statusErr})
+			sendToEdged(resp, request.IsSync())
+			return
+		}
+		errResponse := model.NewMessage(parentID).
+			SetRoute(modules.MetaManagerModuleName, request.GetGroup()).
+			SetResourceOperation(request.GetResource(), model.ResponseErrorOperation).
+			SetType(request.GetType()).
+			FillBody(err.Error())
+		sendToEdged(errResponse, request.IsSync())
+		return
+	}
+	feedbackError(err, request)
+}
+
 func feedbackResponse(message *model.Message, parentID string, resp *model.Message) {
 	resp.BuildHeader(resp.GetID(), parentID, resp.GetTimestamp())
 	sendToEdged(resp, message.IsSync())
+	_, resType, _, _, _ := parseResource(message)
+	if resType == model.ResourceTypePodPatch {
+		return
+	}
 	respToCloud := message.NewRespByMessage(resp, OK)
 	sendToCloud(respToCloud)
 }
@@ -341,14 +374,23 @@ func (m *metaManager) processUpdate(message model.Message) {
 }
 
 func (m *metaManager) processPatch(message model.Message) <-chan struct{} {
+	_, resType, _, _, _ := parseResource(&message)
+	if resType == model.ResourceTypePodPatch && message.GetSource() == modules.EdgedModuleName {
+		if !connect.IsConnected() {
+			klog.Warningf("process remote failed, req[%s], err: %v", msgDebugInfo(&message), errNotConnected)
+			feedbackRemoteError(fmt.Errorf("failed to process remote: %s", errNotConnected), message, message.GetID())
+			return nil
+		}
+		if err := m.handleMessage(&message); err != nil {
+			feedbackRemoteError(err, message, message.GetID())
+			return nil
+		}
+		klog.Infof("Processing pod status PATCH through processRemote, req[%s]", msgDebugInfo(&message))
+		return m.processRemote(message)
+	}
 	if err := m.handleMessage(&message); err != nil {
 		feedbackError(err, message)
 		return nil
-	}
-	_, resType, _, _, _ := parseResource(&message)
-	if resType == model.ResourceTypePodPatch && message.GetSource() == modules.EdgedModuleName {
-		klog.Infof("Processing pod status PATCH through processRemote, req[%s]", msgDebugInfo(&message))
-		return m.processRemote(message)
 	}
 	sendToCloud(&message)
 	return nil
@@ -432,13 +474,38 @@ func (m *metaManager) schedulePodDeleteSnapshotRetry(message model.Message) {
 		return
 	}
 	m.podSnapshotRetrySet = true
+	delay := m.podSnapshotRetryDelay
+	if delay <= 0 {
+		delay = podDeleteSnapshotRetryBackoff
+	}
+	nextDelay := delay * 2
+	if podDeleteSnapshotRetryMaxBackoff > 0 && nextDelay > podDeleteSnapshotRetryMaxBackoff {
+		nextDelay = podDeleteSnapshotRetryMaxBackoff
+	}
+	m.podSnapshotRetryDelay = nextDelay
 	m.podSnapshotRetryMu.Unlock()
 
 	retry := model.NewMessage("").BuildRouter(m.Name(), modules.MetaGroup,
 		message.GetResource(), podSnapshotRetryOperation).FillBody(message.GetContent())
-	time.AfterFunc(podDeleteSnapshotRetryBackoff, func() {
-		beehiveContext.Send(m.Name(), *retry)
-	})
+	go func() {
+		if delay <= 0 {
+			select {
+			case <-beehiveContext.Done():
+				return
+			default:
+				beehiveContext.Send(m.Name(), *retry)
+				return
+			}
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-beehiveContext.Done():
+			return
+		case <-timer.C:
+			beehiveContext.Send(m.Name(), *retry)
+		}
+	}()
 }
 
 func (m *metaManager) processPodDeleteSnapshotRetry(message model.Message) {
@@ -452,6 +519,9 @@ func (m *metaManager) processPodDeleteSnapshotRetry(message model.Message) {
 		m.schedulePodDeleteSnapshotRetry(deleteMessage)
 		return
 	}
+	m.podSnapshotRetryMu.Lock()
+	m.podSnapshotRetryDelay = 0
+	m.podSnapshotRetryMu.Unlock()
 	sendToEdged(&deleteMessage, false)
 }
 
@@ -487,6 +557,17 @@ func processDeletePodDB(message model.Message) error {
 	}
 	if msgPod.UID == "" {
 		return fmt.Errorf("pod delete requires metadata.uid")
+	}
+	if msgPod.Namespace == "" || msgPod.Name == "" {
+		parts := strings.Split(message.GetResource(), constants.ResourceSep)
+		if len(parts) == 3 && parts[1] == model.ResourceTypePod {
+			if msgPod.Namespace == "" {
+				msgPod.Namespace = parts[0]
+			}
+			if msgPod.Name == "" {
+				msgPod.Name = parts[2]
+			}
+		}
 	}
 	podDBList, err := dao.QueryMeta("key", message.GetResource())
 	if err != nil {
@@ -535,53 +616,7 @@ func processDeletePodDB(message model.Message) error {
 }
 
 func deletePodV2(pod corev1.Pod) error {
-	key := fmt.Sprintf("/core/v1/pods/%s/%s", pod.Namespace, pod.Name)
-retry:
-	for {
-		eventSent := false
-		var records []v2.MetaV2
-		if _, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter("key", key).All(&records); err != nil {
-			return err
-		}
-		hasRecords := len(records) > 0
-		for _, record := range records {
-			var stored corev1.Pod
-			if err := json.Unmarshal([]byte(record.Value), &stored); err != nil {
-				return err
-			}
-			if stored.UID != pod.UID {
-				continue
-			}
-			deleted, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter("key", key).Filter("value", record.Value).Delete()
-			if err != nil {
-				return err
-			}
-			if deleted == 0 {
-				continue retry
-			}
-			eventSent = true
-			object := &unstructured.Unstructured{}
-			if err := json.Unmarshal([]byte(record.Value), &object.Object); err != nil {
-				return err
-			}
-			if pod.ResourceVersion != "" {
-				object.SetResourceVersion(pod.ResourceVersion)
-			}
-			watchhook.TriggerPodDeletion(watch.Event{Type: watch.Deleted, Object: object})
-		}
-		if !eventSent && !hasRecords {
-			data, err := json.Marshal(&pod)
-			if err != nil {
-				return err
-			}
-			object := &unstructured.Unstructured{}
-			if err := json.Unmarshal(data, &object.Object); err != nil {
-				return err
-			}
-			watchhook.TriggerPodDeletion(watch.Event{Type: watch.Deleted, Object: object})
-		}
-		return nil
-	}
+	return imitator.DefaultV2Client.DeletePodByUID(context.TODO(), pod)
 }
 
 func (m *metaManager) processQuery(message model.Message) {
@@ -635,14 +670,7 @@ func (m *metaManager) processQuery(message model.Message) {
 }
 
 func queryMetasByType(resType string) (*[]string, error) {
-	metas, err := dao.QueryMeta("type", resType)
-	for attempt := 1; err != nil && resType == model.ResourceTypePod && attempt < podSnapshotQueryRetries; attempt++ {
-		klog.Warningf("query pod snapshot failed, retrying in %s, attempt: %d/%d, err: %v",
-			podSnapshotQueryBackoff, attempt, podSnapshotQueryRetries, err)
-		time.Sleep(podSnapshotQueryBackoff)
-		metas, err = dao.QueryMeta("type", resType)
-	}
-	return metas, err
+	return dao.QueryMeta("type", resType)
 }
 
 func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
@@ -658,24 +686,22 @@ func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
 			time.Duration(metaManagerConfig.Config.RemoteQueryTimeout)*time.Second)
 		if err != nil {
 			klog.Errorf("process remote failed, req[%s], err: %v", msgDebugInfo(&message), err)
-			feedbackError(fmt.Errorf("failed to process remote: %s", err), message)
+			feedbackRemoteError(fmt.Errorf("failed to process remote: %s", err), message, originalID)
 			return
 		}
 		klog.V(4).Infof("process remote: req[%s], resp[%s]", msgDebugInfo(&message), msgDebugInfo(&resp))
-		if _, ok := resp.GetContent().([]byte); ok {
-			content, err := resp.GetContentData()
-			if err != nil {
-				klog.Errorf("decode remote response failed, req[%s], err: %v", msgDebugInfo(&message), err)
-				feedbackError(err, message)
-				return
+		if raw, ok := resp.GetContent().([]byte); ok {
+			if string(raw) == constants.MessageSuccessfulContent {
+				resp.Content = constants.MessageSuccessfulContent
+			} else {
+				var decoded interface{}
+				if err := json.Unmarshal(raw, &decoded); err != nil {
+					klog.Errorf("unmarshal remote response failed, req[%s], err: %v", msgDebugInfo(&message), err)
+					feedbackRemoteError(err, message, originalID)
+					return
+				}
+				resp.Content = decoded
 			}
-			var decoded interface{}
-			if err := json.Unmarshal(content, &decoded); err != nil {
-				klog.Errorf("unmarshal remote response failed, req[%s], err: %v", msgDebugInfo(&message), err)
-				feedbackError(err, message)
-				return
-			}
-			resp.Content = decoded
 		}
 		content, ok := resp.GetContent().(string)
 		if ok && content == constants.MessageSuccessfulContent {
@@ -715,7 +741,7 @@ func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
 				cacheResp := resp
 				cacheResp.Content = mapContent["Object"]
 				if err := m.handleMessage(&cacheResp); err != nil {
-					feedbackError(err, message)
+					feedbackRemoteError(err, message, originalID)
 					return
 				}
 				feedbackResponse(&message, originalID, &resp)
@@ -724,7 +750,7 @@ func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
 			resp.Content = mapContent["Object"]
 		}
 		if err := m.handleMessage(&resp); err != nil {
-			feedbackError(err, message)
+			feedbackRemoteError(err, message, originalID)
 			return
 		}
 		feedbackResponse(&message, originalID, &resp)
@@ -732,67 +758,86 @@ func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
 	return done
 }
 
-func isPodPatchNotFound(message model.Message, errContent interface{}) bool {
-	_, resourceType, _, _, _ := parseResource(&message)
-	if resourceType != model.ResourceTypePodPatch {
+// IsPodPatchNotFoundStatus reports whether status proves the named Pod does not exist.
+func IsPodPatchNotFoundStatus(status *metav1.Status, podName string) bool {
+	if status == nil || podName == "" {
 		return false
 	}
-	errMap, ok := errContent.(map[string]interface{})
-	if !ok {
+	if status.Code != http.StatusNotFound || status.Reason != metav1.StatusReasonNotFound {
 		return false
 	}
-	status, ok := errMap["ErrStatus"].(map[string]interface{})
-	if !ok {
+	if status.Details == nil || status.Details.Group != "" || status.Details.Kind != "pods" || status.Details.Name != podName {
 		return false
 	}
-	code, ok := status["code"].(float64)
-	if !ok || code != 404 {
-		return false
-	}
-	if reason, ok := status["reason"].(string); ok && reason != string(metav1.StatusReasonNotFound) {
-		return false
-	}
-	if details, ok := status["details"].(map[string]interface{}); ok {
-		if causes, ok := details["causes"].([]interface{}); ok {
-			for _, cause := range causes {
-				causeMap, ok := cause.(map[string]interface{})
-				if ok && causeMap["reason"] == string(metav1.CauseTypeUnexpectedServerResponse) {
-					return false
-				}
-			}
+	for _, cause := range status.Details.Causes {
+		if cause.Type == metav1.CauseTypeUnexpectedServerResponse {
+			return false
 		}
 	}
 	return true
 }
 
-func isPodPatchUIDMismatch(message model.Message, errContent interface{}) bool {
-	_, resourceType, _, _, _ := parseResource(&message)
-	if resourceType != model.ResourceTypePodPatch {
+// IsPodPatchUIDMismatchStatus reports whether status proves the named Pod's metadata.uid differs on the server.
+func IsPodPatchUIDMismatchStatus(status *metav1.Status, podName string) bool {
+	if status == nil || podName == "" {
 		return false
 	}
-	errMap, ok := errContent.(map[string]interface{})
-	if !ok {
+	if status.Code != http.StatusUnprocessableEntity || status.Reason != metav1.StatusReasonInvalid {
 		return false
 	}
-	status, ok := errMap["ErrStatus"].(map[string]interface{})
-	if !ok || status["code"] != float64(422) || status["reason"] != string(metav1.StatusReasonInvalid) {
+	if status.Details == nil || status.Details.Group != "" || status.Details.Kind != "Pod" || status.Details.Name != podName {
 		return false
 	}
-	details, ok := status["details"].(map[string]interface{})
-	if !ok {
-		return false
-	}
-	causes, ok := details["causes"].([]interface{})
-	if !ok {
-		return false
-	}
-	for _, cause := range causes {
-		causeMap, ok := cause.(map[string]interface{})
-		if ok && causeMap["field"] == "metadata.uid" {
+	for _, cause := range status.Details.Causes {
+		if cause.Field == "metadata.uid" && cause.Type == metav1.CauseTypeFieldValueInvalid {
 			return true
 		}
 	}
 	return false
+}
+
+func decodeStatusError(errContent interface{}) (*metav1.Status, bool) {
+	errMap, ok := errContent.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	rawStatus, ok := errMap["ErrStatus"]
+	if !ok || rawStatus == nil {
+		return nil, false
+	}
+	data, err := json.Marshal(rawStatus)
+	if err != nil {
+		return nil, false
+	}
+	var status metav1.Status
+	if err := json.Unmarshal(data, &status); err != nil {
+		return nil, false
+	}
+	return &status, true
+}
+
+func isPodPatchNotFound(message model.Message, errContent interface{}) bool {
+	_, resourceType, podName, _, _ := parseResource(&message)
+	if resourceType != model.ResourceTypePodPatch || podName == "" {
+		return false
+	}
+	status, ok := decodeStatusError(errContent)
+	if !ok {
+		return false
+	}
+	return IsPodPatchNotFoundStatus(status, podName)
+}
+
+func isPodPatchUIDMismatch(message model.Message, errContent interface{}) bool {
+	_, resourceType, podName, _, _ := parseResource(&message)
+	if resourceType != model.ResourceTypePodPatch || podName == "" {
+		return false
+	}
+	status, ok := decodeStatusError(errContent)
+	if !ok {
+		return false
+	}
+	return IsPodPatchUIDMismatchStatus(status, podName)
 }
 
 func (m *metaManager) deleteMissingPod(patchMessage model.Message) error {
@@ -811,6 +856,7 @@ func (m *metaManager) deleteMissingPod(patchMessage model.Message) error {
 	if len(parts) != 3 || parts[0] == "" || parts[1] != model.ResourceTypePodPatch || parts[2] == "" {
 		return fmt.Errorf("invalid pod patch resource: %s", patchMessage.GetResource())
 	}
+	pod.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
 	pod.Namespace, pod.Name = parts[0], parts[2]
 	resource := strings.Replace(patchMessage.GetResource(),
 		constants.ResourceSep+model.ResourceTypePodPatch+constants.ResourceSep,
@@ -818,8 +864,7 @@ func (m *metaManager) deleteMissingPod(patchMessage model.Message) error {
 	deleteMessage := model.NewMessage("").
 		BuildRouter(m.Name(), modules.MetaGroup, resource, model.DeleteOperation).
 		FillBody(&pod)
-	resp, err := m.sendSync(m.Name(), *deleteMessage,
-		time.Duration(metaManagerConfig.Config.RemoteQueryTimeout)*time.Second)
+	resp, err := m.sendSync(m.Name(), *deleteMessage, podLocalCleanupTimeout)
 	if err != nil {
 		return fmt.Errorf("wait for local pod cleanup: %w", err)
 	}

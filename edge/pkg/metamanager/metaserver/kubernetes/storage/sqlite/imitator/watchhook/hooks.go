@@ -76,8 +76,12 @@ func trigger(e watch.Event, checkVersion bool, allowUIDFallback bool) {
 		if hook.GetName() != "" {
 			compName = hook.GetName() == name
 		}
-		if e.Type == watch.Deleted && allowUIDFallback && accessor.GetResourceVersion() == "" {
-			compRev = hook.GetObservedUID() != "" && hook.GetObservedUID() == string(accessor.GetUID())
+		observedUID := hook.GetObservedUID(key)
+		eventUID := string(accessor.GetUID())
+		if e.Type == watch.Deleted && allowUIDFallback && observedUID != "" && eventUID != "" && observedUID != eventUID {
+			compRev = false
+		} else if e.Type == watch.Deleted && allowUIDFallback && accessor.GetResourceVersion() == "" {
+			compRev = observedUID != "" && observedUID == eventUID
 		} else if checkVersion && hook.GetResourceVersion() != 0 {
 			rev, err := etcd3.Versioner.ParseResourceVersion(accessor.GetResourceVersion())
 			if err != nil {
@@ -88,12 +92,14 @@ func trigger(e watch.Event, checkVersion bool, allowUIDFallback bool) {
 		}
 		if compGVR && compNS && compName && compRev {
 			if e.Type != watch.Deleted {
-				hook.SetObservedUID(string(accessor.GetUID()))
+				hook.SetObservedUID(key, eventUID)
+			} else {
+				hook.DeleteObservedUID(key)
 			}
 			err = hook.Do(e)
 			if err != nil {
 				klog.Errorf("failed to operate event, %v", err)
-				return
+				continue
 			}
 		}
 	}

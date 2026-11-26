@@ -10,17 +10,18 @@ import (
 
 func TestTriggerConcurrentWithHookLifecycle(t *testing.T) {
 	const iterations = 200
-	events := make(chan watch.Event, iterations)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := 0; i < iterations; i++ {
+			events := make(chan watch.Event, 4)
 			hook, err := NewWatchHook("/core/v1/pods/default/pod", 0, NewChanReceiver(events))
 			if err != nil {
 				t.Errorf("NewWatchHook: %v", err)
 				return
 			}
 			hook.Stop()
+			close(events)
 		}
 	}()
 
@@ -35,17 +36,59 @@ func TestTriggerConcurrentWithHookLifecycle(t *testing.T) {
 	}
 }
 
-func podObject(uid, resourceVersion string) *unstructured.Unstructured {
+func namedPodObject(name, uid, resourceVersion string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "v1",
 		"kind":       "Pod",
 		"metadata": map[string]interface{}{
-			"name":            "pod",
+			"name":            name,
 			"namespace":       "default",
 			"uid":             uid,
 			"resourceVersion": resourceVersion,
 		},
 	}}
+}
+
+func podObject(uid, resourceVersion string) *unstructured.Unstructured {
+	return namedPodObject("pod", uid, resourceVersion)
+}
+
+func TestTriggerPodDeletionMultiPodWatchTracksUIDPerKey(t *testing.T) {
+	events := make(chan watch.Event, 8)
+	hook, err := NewWatchHook("/core/v1/pods/default", 100, NewChanReceiver(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hook.Stop()
+
+	Trigger(watch.Event{Type: watch.Added, Object: namedPodObject("pod-a", "uid-a", "200")})
+	Trigger(watch.Event{Type: watch.Added, Object: namedPodObject("pod-b", "uid-b", "201")})
+	for i := 0; i < 2; i++ {
+		select {
+		case <-events:
+		case <-time.After(time.Second):
+			t.Fatal("missing Added event")
+		}
+	}
+
+	// Empty-RV deletion for pod-a must still match even though pod-b was observed afterwards.
+	TriggerPodDeletion(watch.Event{Type: watch.Deleted, Object: namedPodObject("pod-a", "uid-a", "")})
+	select {
+	case event := <-events:
+		if event.Type != watch.Deleted || event.Object.(*unstructured.Unstructured).GetName() != "pod-a" {
+			t.Fatalf("unexpected deletion event: %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pod-a deletion was not delivered on multi-pod watcher")
+	}
+
+	// Stale UID deletion for pod-b must be blocked even with a higher RV.
+	TriggerPodDeletion(watch.Event{Type: watch.Deleted, Object: namedPodObject("pod-b", "uid-b-old", "500")})
+	select {
+	case event := <-events:
+		t.Fatalf("stale UID deletion for pod-b was delivered: %#v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
 }
 
 func TestTriggerPodDeletionHonorsResourceVersion(t *testing.T) {
