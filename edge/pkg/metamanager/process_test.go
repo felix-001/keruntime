@@ -582,14 +582,17 @@ func TestProcessDelete(t *testing.T) {
 	querySetterMock.EXPECT().All(gomock.Any()).SetArg(0, *fakeDao).Return(int64(1), nil).Times(1)
 	querySetterMock.EXPECT().All(gomock.Any()).SetArg(0, []v2.MetaV2{}).Return(int64(0), nil).Times(1)
 	querySetterMock.EXPECT().Delete().Return(int64(1), nil).Times(2)
-	ormerMock.EXPECT().QueryTable(gomock.Any()).Return(querySetterMock).Times(4)
+	ormerMock.EXPECT().QueryTable(gomock.Any()).Return(querySetterMock).Times(5)
+	snapshotQueryMock := beego.NewMockQuerySeter(mockCtrl)
+	querySetterMock.EXPECT().Filter("type", model.ResourceTypePod).Return(snapshotQueryMock)
+	snapshotQueryMock.EXPECT().All(gomock.Any()).SetArg(0, []dao.Meta{}).Return(int64(0), nil)
 
 	resource = fmt.Sprintf("test/%s/nginx", model.ResourceTypePod)
 	msg = model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, resource, model.DeleteOperation).FillBody(podBytes)
 	meta.processDelete(*msg)
 	message, _ = beehiveContext.Receive(ModuleNameEdged)
 	t.Run("SuccessDeletePodToEdged", func(t *testing.T) {
-		want := ModuleNameController
+		want := modules.MetaManagerModuleName
 		if message.GetSource() != want {
 			t.Errorf("Wrong message received : Wanted from source %v and Got from source %v", want, message.GetSource())
 		}
@@ -598,6 +601,9 @@ func TestProcessDelete(t *testing.T) {
 		}
 		if message.GetResource() != resource {
 			t.Errorf("Wrong message received resource: Wanted %v and Got %v", resource, message.GetResource())
+		}
+		if snapshot, ok := message.GetContent().(PodDeleteSnapshot); !ok || len(snapshot) != 0 {
+			t.Errorf("Expected an empty pod delete snapshot, got %#v", message.GetContent())
 		}
 	})
 	message, _ = beehiveContext.Receive(ModuleNameEdgeHub)
@@ -761,17 +767,33 @@ func TestProcessPodPatchResponse(t *testing.T) {
 				FillBody(`{"metadata":{"uid":"old-uid"}}`)
 			request.Header.Sync = false
 			cloudResult := make(chan model.Message, 1)
-			go func() {
-				cloudRequest, _ := beehiveContext.Receive(ModuleNameEdgeHub)
+			cleanupResponse := make(chan model.Message, 1)
+			manager.syncTransport = func(module string, cloudRequest model.Message, _ time.Duration) (model.Message, error) {
+				if module == manager.Name() {
+					cloudRequest.Header.Sync = true
+					beehiveContext.Send(module, cloudRequest)
+					select {
+					case response := <-cleanupResponse:
+						if response.GetParentID() != cloudRequest.GetID() {
+							return model.Message{}, fmt.Errorf("local cleanup response not correlated")
+						}
+						return response, nil
+					case <-time.After(5 * time.Second):
+						return model.Message{}, fmt.Errorf("no local cleanup response")
+					}
+				}
+				if module != ModuleNameEdgeHub {
+					return model.Message{}, fmt.Errorf("unexpected sync destination %q", module)
+				}
 				response := cloudRequest.NewRespByMessage(&cloudRequest, map[string]interface{}{
 					"Object": map[string]interface{}{"metadata": map[string]interface{}{"uid": "old-uid"}}, "Err": nil,
 				})
 				if notFound {
 					response.Content = map[string]interface{}{"Object": nil, "Err": map[string]interface{}{"ErrStatus": map[string]interface{}{"code": float64(404)}}}
 				}
-				beehiveContext.SendResp(*response)
 				cloudResult <- cloudRequest
-			}()
+				return *response, nil
+			}
 			done := manager.processPatch(*request)
 			if done == nil {
 				t.Fatal("PATCH bypassed processRemote")
@@ -814,7 +836,7 @@ func TestProcessPodPatchResponse(t *testing.T) {
 					!ok || len(pods) != 1 || pods[0] != `{"metadata":{"uid":"remaining-uid"}}` {
 					t.Fatalf("unexpected delete snapshot: %+v", deleted)
 				}
-				beehiveContext.SendResp(*deleted.NewRespByMessage(&deleted, OK))
+				cleanupResponse <- *deleted.NewRespByMessage(&deleted, OK)
 			}
 			response := receive(ModuleNameEdged)
 			if response.GetParentID() != request.GetID() {

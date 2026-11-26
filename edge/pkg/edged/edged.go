@@ -247,12 +247,10 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 			} else {
 				_, isDeleteSnapshot := result.GetContent().(metamanager.PodDeleteSnapshot)
 				if op == model.DeleteOperation && result.GetSource() == modules.MetaManagerModuleName && isDeleteSnapshot {
+					klog.InfoS("Received pod delete snapshot from MetaManager", "resource", result.GetResource(), "messageID", result.GetID())
 					err = e.handlePodListFromMetaManager(content, rawUpdateChan)
-					if err == nil {
-						klog.InfoS("Pod sync: Edged submitted delete snapshot to kubelet config", "resource", result.GetResource(), "messageID", result.GetID())
-					}
 				} else {
-					err = e.handlePod(op, result.GetID(), content, rawUpdateChan)
+					err = e.handlePod(op, content, rawUpdateChan)
 				}
 				if err != nil {
 					klog.ErrorS(err, "Pod sync: Edged failed to handle message", "operation", op, "resource", result.GetResource(), "messageID", result.GetID())

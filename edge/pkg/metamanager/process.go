@@ -386,9 +386,6 @@ func (m *metaManager) processDelete(message model.Message) {
 		err = attachPodDeleteSnapshot(&edgedMessage)
 	}
 	if err != nil {
-		if resType == model.ResourceTypePod {
-			klog.ErrorS(err, "Pod sync: MetaManager failed to process pod delete", "resource", message.GetResource(), "messageID", message.GetID())
-		}
 		if localCleanup {
 			errResponse := model.NewMessage(message.GetID()).
 				SetResourceOperation(message.GetResource(), model.ResponseErrorOperation).
@@ -409,7 +406,7 @@ func (m *metaManager) processDelete(message model.Message) {
 	if msgSource != cloudmodules.PolicyControllerModuleName {
 		// Notify edged
 		if localCleanup {
-			sendToEdged(&edgedMessage, false)
+			beehiveContext.Send(modules.EdgedModuleName, edgedMessage)
 			return
 		}
 		sendToEdged(&edgedMessage, false)
@@ -602,7 +599,7 @@ func (m *metaManager) processRemote(message model.Message) <-chan struct{} {
 		// TODO: retry
 		originalID := message.GetID()
 		message.UpdateID()
-		resp, err := beehiveContext.SendSync(
+		resp, err := m.sendSync(
 			string(metaManagerConfig.Config.ContextSendModule),
 			message,
 			time.Duration(metaManagerConfig.Config.RemoteQueryTimeout)*time.Second)
@@ -712,7 +709,7 @@ func (m *metaManager) deleteMissingPod(patchMessage model.Message) error {
 	deleteMessage := model.NewMessage("").
 		BuildRouter(m.Name(), modules.MetaGroup, resource, model.DeleteOperation).
 		FillBody(&pod)
-	resp, err := beehiveContext.SendSync(m.Name(), *deleteMessage,
+	resp, err := m.sendSync(m.Name(), *deleteMessage,
 		time.Duration(metaManagerConfig.Config.RemoteQueryTimeout)*time.Second)
 	if err != nil {
 		return fmt.Errorf("wait for local pod cleanup: %w", err)
