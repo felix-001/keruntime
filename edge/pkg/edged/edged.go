@@ -225,6 +225,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 
 		switch resType {
 		case model.ResourceTypePod:
+			klog.InfoS("Pod sync: Edged received message", "operation", op, "resource", result.GetResource(), "source", result.GetSource(), "messageID", result.GetID())
 			if op == model.ResponseOperation && resID == "" && result.GetSource() == modules.MetaManagerModuleName {
 				err := e.handlePodListFromMetaManager(content, rawUpdateChan)
 				if err != nil {
@@ -246,13 +247,15 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 			} else {
 				_, isDeleteSnapshot := result.GetContent().(metamanager.PodDeleteSnapshot)
 				if op == model.DeleteOperation && result.GetSource() == modules.MetaManagerModuleName && isDeleteSnapshot {
-					klog.InfoS("Received pod delete snapshot from MetaManager", "resource", result.GetResource(), "messageID", result.GetID())
 					err = e.handlePodListFromMetaManager(content, rawUpdateChan)
+					if err == nil {
+						klog.InfoS("Pod sync: Edged submitted delete snapshot to kubelet config", "resource", result.GetResource(), "messageID", result.GetID())
+					}
 				} else {
-					err = e.handlePod(op, content, rawUpdateChan)
+					err = e.handlePod(op, result.GetID(), content, rawUpdateChan)
 				}
 				if err != nil {
-					klog.Errorf("handle pod failed: %v", err)
+					klog.ErrorS(err, "Pod sync: Edged failed to handle message", "operation", op, "resource", result.GetResource(), "messageID", result.GetID())
 					continue
 				}
 				if op == model.DeleteOperation && result.IsSync() {
@@ -284,7 +287,7 @@ func MakeKubeClientBridge(kubeletDeps *kubelet.Dependencies) {
 	kubeletDeps.HeartbeatClient = client
 }
 
-func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interface{}) (err error) {
+func (e *edged) handlePod(op, messageID string, content []byte, updatesChan chan<- interface{}) (err error) {
 	var pod v1.Pod
 	err = json.Unmarshal(content, &pod)
 	if err != nil {
@@ -326,7 +329,10 @@ func (e *edged) handlePod(op string, content []byte, updatesChan chan<- interfac
 			}
 		}
 		updates := &kubelettypes.PodUpdate{Op: kubelettypes.UPDATE, Pods: pods, Source: kubelettypes.ApiserverSource}
+		klog.InfoS("Pod sync: Edged submitting pod update to kubelet config", "operation", op, "pod", klog.KObj(&pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "messageID", messageID, "deletionTimestamp", pod.DeletionTimestamp)
 		updatesChan <- *updates
+	} else {
+		klog.InfoS("Pod sync: Edged ignored pod for another node", "operation", op, "pod", klog.KObj(&pod), "podUID", pod.UID, "podNode", pod.Spec.NodeName, "node", e.nodeName, "messageID", messageID)
 	}
 
 	return nil

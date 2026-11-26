@@ -87,9 +87,9 @@ func (dc *DownstreamController) syncPod() {
 				continue
 			}
 			if err := dc.messageLayer.Send(*msg); err != nil {
-				klog.Warningf("send message failed with error: %s, operation: %s, resource: %s", err, msg.GetOperation(), msg.GetResource())
+				klog.ErrorS(err, "Pod sync: CloudCore message enqueue failed", "operation", msg.GetOperation(), "resource", resource, "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "messageID", msg.GetID())
 			} else {
-				klog.V(4).Infof("send message successfully, operation: %s, resource: %s", msg.GetOperation(), msg.GetResource())
+				klog.InfoS("Pod sync: CloudCore message enqueued", "operation", msg.GetOperation(), "resource", resource, "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "messageID", msg.GetID())
 			}
 		}
 	}

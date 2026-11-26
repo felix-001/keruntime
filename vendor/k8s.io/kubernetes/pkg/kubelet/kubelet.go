@@ -396,7 +396,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		resyncInterval:                          kubeCfg.SyncFrequency.Duration,
 		sourcesReady:                            config.NewSourcesReady(kubeDeps.PodConfig.SeenAllSources),
 		registerNode:                            registerNode,
-		nodeType: 								 nodeType,
+		nodeType:                                nodeType,
 		registerWithTaints:                      registerWithTaints,
 		registerSchedulable:                     registerSchedulable,
 		dnsConfigurer:                           dns.NewConfigurer(kubeDeps.Recorder, nodeRef, nodeIPs, clusterDNS, kubeCfg.ClusterDomain, kubeCfg.ResolverConfig),
@@ -815,7 +815,7 @@ type Kubelet struct {
 	// a list of node labels to register
 	nodeLabels map[string]string
 	// edge node type, keruntime specific field
-	nodeType string 
+	nodeType string
 	// Last timestamp when runtime responded on ping.
 	// Mutex is used to protect this value.
 	runtimeState *runtimeState
@@ -2047,6 +2047,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 	start := kl.clock.Now()
 	sort.Sort(sliceutils.PodsByCreationTime(pods))
 	for _, pod := range pods {
+		klog.InfoS("Pod sync: kubelet received add", "pod", klog.KObj(pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion)
 		existingPods := kl.podManager.GetPods()
 		// Always add the pod to the pod manager. Kubelet relies on the pod
 		// manager as the source of truth for the desired state. If a pod does
@@ -2067,6 +2068,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 
 			// Check if we can admit the pod; if not, reject it.
 			if ok, reason, message := kl.canAdmitPod(activePods, pod); !ok {
+				klog.InfoS("Pod sync: kubelet rejected pod admission", "pod", klog.KObj(pod), "podUID", pod.UID, "reason", reason, "message", message)
 				kl.rejectPod(pod, reason, message)
 				continue
 			}
@@ -2081,6 +2083,7 @@ func (kl *Kubelet) HandlePodAdditions(pods []*v1.Pod) {
 func (kl *Kubelet) HandlePodUpdates(pods []*v1.Pod) {
 	start := kl.clock.Now()
 	for _, pod := range pods {
+		klog.InfoS("Pod sync: kubelet received update", "pod", klog.KObj(pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "deletionTimestamp", pod.DeletionTimestamp)
 		kl.podManager.UpdatePod(pod)
 		kl.dispatchWork(pod, kubetypes.SyncPodUpdate, nil, start)
 	}
@@ -2090,11 +2093,12 @@ func (kl *Kubelet) HandlePodUpdates(pods []*v1.Pod) {
 // being removed from a config source.
 func (kl *Kubelet) HandlePodRemoves(pods []*v1.Pod) {
 	for _, pod := range pods {
+		klog.InfoS("Pod sync: kubelet received remove", "pod", klog.KObj(pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion)
 		kl.podManager.DeletePod(pod)
 		// Deletion is allowed to fail because the periodic cleanup routine
 		// will trigger deletion again.
 		if err := kl.deletePod(pod); err != nil {
-			klog.V(2).InfoS("Failed to delete pod", "pod", klog.KObj(pod), "err", err)
+			klog.ErrorS(err, "Pod sync: kubelet failed to initiate pod removal", "pod", klog.KObj(pod), "podUID", pod.UID)
 		}
 	}
 }

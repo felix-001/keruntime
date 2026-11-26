@@ -80,6 +80,9 @@ func (sctl *SyncController) gcOrphanedObjectSync(sync *v1alpha1.ObjectSync) {
 	object.SetUID(types.UID(getObjectUID(sync.Name)))
 	if msg := buildEdgeControllerMessage(nodeName, sync.Namespace, resourceType, sync.Spec.ObjectName, model.DeleteOperation, object); msg != nil {
 		beehiveContext.Send(commonconst.DefaultContextSendModuleName, *msg)
+		if resourceType == model.ResourceTypePod {
+			klog.InfoS("Pod sync: CloudCore compensating delete enqueued", "operation", msg.GetOperation(), "resource", msg.GetResource(), "podUID", object.GetUID(), "messageID", msg.GetID())
+		}
 	} else {
 		if err := sctl.crdclient.ReliablesyncsV1alpha1().ObjectSyncs(sync.Namespace).Delete(context.Background(), sync.Name, *metav1.NewDeleteOptions(0)); err != nil {
 			klog.Errorf("Failed to delete objectsync %s: %v", sync.Name, err)

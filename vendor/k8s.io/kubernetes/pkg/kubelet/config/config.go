@@ -22,7 +22,7 @@ import (
 	"reflect"
 	"sync"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
@@ -227,6 +227,7 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 	// updatePodFunc is the local function which updates the pod cache *oldPods* with new pods *newPods*.
 	// After updated, new pod will be stored in the pod cache *pods*.
 	// Notice that *pods* and *oldPods* could be the same cache.
+	update := change.(kubetypes.PodUpdate)
 	updatePodsFunc := func(newPods []*v1.Pod, oldPods, pods map[types.UID]*v1.Pod) {
 		filtered := filterInvalidPods(newPods, source, s.recorder)
 		for _, ref := range filtered {
@@ -244,6 +245,8 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 					reconcilePods = append(reconcilePods, existing)
 				} else if needGracefulDelete {
 					deletePods = append(deletePods, existing)
+				} else if update.Op == kubetypes.UPDATE && source == kubetypes.ApiserverSource {
+					klog.InfoS("Pod sync: kubelet config produced no event for update", "pod", klog.KObj(ref), "podUID", ref.UID, "resourceVersion", ref.ResourceVersion, "deletionTimestamp", ref.DeletionTimestamp)
 				}
 				continue
 			}
@@ -253,7 +256,6 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 		}
 	}
 
-	update := change.(kubetypes.PodUpdate)
 	switch update.Op {
 	case kubetypes.ADD, kubetypes.UPDATE, kubetypes.DELETE:
 		if update.Op == kubetypes.ADD {
@@ -407,11 +409,11 @@ func podsDifferSemantically(existing, ref *v1.Pod) bool {
 }
 
 // checkAndUpdatePod updates existing, and:
-//   * if ref makes a meaningful change, returns needUpdate=true
-//   * if ref makes a meaningful change, and this change is graceful deletion, returns needGracefulDelete=true
-//   * if ref makes no meaningful change, but changes the pod status, returns needReconcile=true
-//   * else return all false
-//   Now, needUpdate, needGracefulDelete and needReconcile should never be both true
+//   - if ref makes a meaningful change, returns needUpdate=true
+//   - if ref makes a meaningful change, and this change is graceful deletion, returns needGracefulDelete=true
+//   - if ref makes no meaningful change, but changes the pod status, returns needReconcile=true
+//   - else return all false
+//     Now, needUpdate, needGracefulDelete and needReconcile should never be both true
 func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGracefulDelete bool) {
 
 	// 1. this is a reconcile

@@ -897,6 +897,10 @@ func (p *podWorkers) managePodLoop(podUpdates <-chan podWork) {
 		}
 
 		klog.V(4).InfoS("Processing pod event", "pod", klog.KObj(pod), "podUID", pod.UID, "updateType", update.WorkType)
+		logPodWork := update.WorkType != SyncPodWork || update.Options.UpdateType != kubetypes.SyncPodSync
+		if logPodWork {
+			klog.InfoS("Pod sync: kubelet worker started", "pod", klog.KObj(pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "workType", update.WorkType, "updateType", update.Options.UpdateType)
+		}
 		var isTerminal bool
 		err := func() error {
 			// The worker is responsible for ensuring the sync method sees the appropriate
@@ -950,16 +954,23 @@ func (p *podWorkers) managePodLoop(podUpdates <-chan podWork) {
 			lastSyncTime = time.Now()
 			return err
 		}()
+		if logPodWork && err == nil {
+			klog.InfoS("Pod sync: kubelet worker completed without error", "pod", klog.KObj(pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "workType", update.WorkType, "updateType", update.Options.UpdateType)
+		}
 
 		var phaseTransition bool
 		switch {
 		case err == context.Canceled:
 			// when the context is cancelled we expect an update to already be queued
-			klog.V(2).InfoS("Sync exited with context cancellation error", "pod", klog.KObj(pod), "podUID", pod.UID, "updateType", update.WorkType)
+			if logPodWork {
+				klog.InfoS("Pod sync: kubelet worker canceled", "pod", klog.KObj(pod), "podUID", pod.UID, "workType", update.WorkType, "updateType", update.Options.UpdateType)
+			} else {
+				klog.V(2).InfoS("Sync exited with context cancellation error", "pod", klog.KObj(pod), "podUID", pod.UID, "updateType", update.WorkType)
+			}
 
 		case err != nil:
 			// we will queue a retry
-			klog.ErrorS(err, "Error syncing pod, skipping", "pod", klog.KObj(pod), "podUID", pod.UID)
+			klog.ErrorS(err, "Error syncing pod, skipping", "pod", klog.KObj(pod), "podUID", pod.UID, "resourceVersion", pod.ResourceVersion, "workType", update.WorkType, "updateType", update.Options.UpdateType)
 
 		case update.WorkType == TerminatedPodWork:
 			// we can shut down the worker

@@ -67,6 +67,10 @@ func sendToEdged(message *model.Message, sync bool) {
 		beehiveContext.SendResp(*message)
 	} else {
 		beehiveContext.Send(modules.EdgedModuleName, *message)
+		_, resType, resID, _, _ := parseResource(message)
+		if resType == model.ResourceTypePod && resID != "" {
+			klog.InfoS("Pod sync: MetaManager forwarded message to Edged", "operation", message.GetOperation(), "resource", message.GetResource(), "source", message.GetSource(), "messageID", message.GetID())
+		}
 	}
 }
 
@@ -382,6 +386,9 @@ func (m *metaManager) processDelete(message model.Message) {
 		err = attachPodDeleteSnapshot(&edgedMessage)
 	}
 	if err != nil {
+		if resType == model.ResourceTypePod {
+			klog.ErrorS(err, "Pod sync: MetaManager failed to process pod delete", "resource", message.GetResource(), "messageID", message.GetID())
+		}
 		if localCleanup {
 			errResponse := model.NewMessage(message.GetID()).
 				SetResourceOperation(message.GetResource(), model.ResponseErrorOperation).
@@ -402,7 +409,7 @@ func (m *metaManager) processDelete(message model.Message) {
 	if msgSource != cloudmodules.PolicyControllerModuleName {
 		// Notify edged
 		if localCleanup {
-			beehiveContext.Send(modules.EdgedModuleName, edgedMessage)
+			sendToEdged(&edgedMessage, false)
 			return
 		}
 		sendToEdged(&edgedMessage, false)
@@ -429,6 +436,7 @@ func attachPodDeleteSnapshot(message *model.Message) error {
 	}
 	message.SetRoute(modules.MetaManagerModuleName, message.GetGroup())
 	message.FillBody(PodDeleteSnapshot(*metas))
+	klog.InfoS("Pod sync: MetaManager prepared delete snapshot", "resource", message.GetResource(), "podUID", pod.UID, "messageID", message.GetID(), "podCount", len(*metas))
 	return nil
 }
 
@@ -739,6 +747,13 @@ func (m *metaManager) processVolume(message model.Message) {
 
 func (m *metaManager) process(message model.Message) {
 	operation := message.GetOperation()
+	switch operation {
+	case model.InsertOperation, model.UpdateOperation, model.DeleteOperation, model.ResponseOperation:
+		_, resType, _, _, _ := parseResource(&message)
+		if resType == model.ResourceTypePod && message.GetSource() != modules.EdgedModuleName {
+			klog.InfoS("Pod sync: MetaManager received message", "operation", operation, "resource", message.GetResource(), "source", message.GetSource(), "messageID", message.GetID())
+		}
+	}
 
 	switch operation {
 	case model.InsertOperation:
