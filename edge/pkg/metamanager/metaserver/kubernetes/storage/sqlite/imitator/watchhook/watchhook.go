@@ -63,12 +63,16 @@ func (h *WatchHook) GetResourceVersion() uint64 {
 	return h.ResourceVersion
 }
 
+// GetObservedUID returns the last non-Deleted object UID delivered to this hook
+// for key via Trigger/TriggerPodDeletion. Objects seeded directly by initial List/sync
+// are not tracked here.
 func (h *WatchHook) GetObservedUID(key string) string {
 	h.lock.Lock()
 	defer h.lock.Unlock()
 	return h.observedUIDs[key]
 }
 
+// SetObservedUID records the latest non-Deleted object UID delivered to this hook for key.
 func (h *WatchHook) SetObservedUID(key, uid string) {
 	h.lock.Lock()
 	if h.observedUIDs == nil {
@@ -78,6 +82,7 @@ func (h *WatchHook) SetObservedUID(key, uid string) {
 	h.lock.Unlock()
 }
 
+// DeleteObservedUID clears the tracked UID for key after a Deleted event is delivered.
 func (h *WatchHook) DeleteObservedUID(key string) {
 	h.lock.Lock()
 	delete(h.observedUIDs, key)

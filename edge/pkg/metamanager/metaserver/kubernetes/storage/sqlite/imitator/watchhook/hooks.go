@@ -38,16 +38,22 @@ func DeleteHook(id string) error {
 	return fmt.Errorf("unable to delete %q because it was not registered", id)
 }
 
-// Trigger trigger the corresponding hook to serve watch based on the event passed in
+// Trigger triggers matching hooks to deliver a watch event, enforcing ResourceVersion ordering.
 func Trigger(e watch.Event) {
-	trigger(e, true, false)
+	trigger(e, false)
 }
 
+// TriggerPodDeletion delivers a Pod Deleted event while guarding against stale UID deletions:
+// if a hook already observed a different UID for the same key, the stale Deleted event is dropped;
+// if the event has no ResourceVersion, delivery is restricted to hooks that observed the same UID.
 func TriggerPodDeletion(e watch.Event) {
-	trigger(e, true, true)
+	trigger(e, true)
 }
 
-func trigger(e watch.Event, checkVersion bool, allowUIDFallback bool) {
+// trigger dispatches e to all matching hooks. When allowUIDFallback is true, Deleted events
+// are additionally guarded by each hook's per-key observedUID (recorded only from non-Deleted
+// events delivered through trigger).
+func trigger(e watch.Event, allowUIDFallback bool) {
 	key, err := metaserver.KeyFuncObj(e.Object)
 	if err != nil {
 		klog.Errorf("failed to get key, %v", err)
@@ -82,7 +88,7 @@ func trigger(e watch.Event, checkVersion bool, allowUIDFallback bool) {
 			compRev = false
 		} else if e.Type == watch.Deleted && allowUIDFallback && accessor.GetResourceVersion() == "" {
 			compRev = observedUID != "" && observedUID == eventUID
-		} else if checkVersion && hook.GetResourceVersion() != 0 {
+		} else if hook.GetResourceVersion() != 0 {
 			rev, err := etcd3.Versioner.ParseResourceVersion(accessor.GetResourceVersion())
 			if err != nil {
 				klog.Errorf("failed to parse resource version, %v", err)

@@ -28,6 +28,8 @@ type Client interface {
 	Inject(msg model.Message)
 	InsertOrUpdateObj(ctx context.Context, obj runtime.Object) error
 	DeleteObj(ctx context.Context, obj runtime.Object) error
+	// DeletePodByUID removes a Pod record from meta_v2 only when its stored UID matches pod.UID
+	// and dispatches the corresponding watch.Deleted event under imitator's revision contract.
 	DeletePodByUID(ctx context.Context, pod corev1.Pod) error
 
 	GetRevision() uint64

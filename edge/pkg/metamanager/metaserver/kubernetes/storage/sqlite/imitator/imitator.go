@@ -124,6 +124,11 @@ func (s *imitator) DeleteObj(ctx context.Context, obj runtime.Object) error {
 
 const maxDeletePodByUIDRetries = 3
 
+// DeletePodByUID deletes the meta_v2 Pod record for pod.Namespace/pod.Name only when
+// the stored Pod's metadata.uid matches pod.UID, then notifies matching WatchHooks.
+// For local deletions without an authoritative ResourceVersion (e.g. 404/UID-mismatch
+// self-healing), it synthesizes a monotonically increasing revision past s.revision+1
+// and advances s.revision so list-then-watch clients receive the Deleted event.
 func (s *imitator) DeletePodByUID(ctx context.Context, pod corev1.Pod) error {
 	if pod.Namespace == "" || pod.Name == "" || pod.UID == "" {
 		return fmt.Errorf("pod delete requires namespace, name and metadata.uid")
@@ -183,6 +188,7 @@ func (s *imitator) DeletePodByUID(ctx context.Context, pod corev1.Pod) error {
 					if storedRV, err := s.versioner.ParseResourceVersion(object.GetResourceVersion()); err == nil && storedRV+1 > deleteRV {
 						deleteRV = storedRV + 1
 					}
+					s.revision = deleteRV
 					object.SetResourceVersion(strconv.FormatUint(deleteRV, 10))
 				}
 				events = append(events, watch.Event{Type: watch.Deleted, Object: object})
@@ -202,6 +208,15 @@ func (s *imitator) DeletePodByUID(ctx context.Context, pod corev1.Pod) error {
 				object := &unstructured.Unstructured{}
 				if err := json.Unmarshal(data, &object.Object); err != nil {
 					return err
+				}
+				if podCopy.ResourceVersion != "" {
+					if rv, err := s.versioner.ParseResourceVersion(podCopy.ResourceVersion); err == nil && rv > s.revision {
+						s.revision = rv
+					}
+				} else {
+					deleteRV := s.revision + 2
+					s.revision = deleteRV
+					object.SetResourceVersion(strconv.FormatUint(deleteRV, 10))
 				}
 				events = append(events, watch.Event{Type: watch.Deleted, Object: object})
 			}

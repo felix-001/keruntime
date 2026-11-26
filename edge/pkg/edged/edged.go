@@ -226,7 +226,7 @@ func (e *edged) syncPod(podCfg *config.PodConfig) {
 
 		switch resType {
 		case model.ResourceTypePod:
-			klog.InfoS("Pod sync: Edged received message", "operation", op, "resource", result.GetResource(), "source", result.GetSource(), "messageID", result.GetID())
+			klog.V(4).InfoS("Pod sync: Edged received message", "operation", op, "resource", result.GetResource(), "source", result.GetSource(), "messageID", result.GetID())
 			if op == model.ResponseOperation && resID == "" && result.GetSource() == modules.MetaManagerModuleName {
 				err := e.handlePodListFromMetaManager(content, rawUpdateChan)
 				if err != nil {
@@ -356,7 +356,7 @@ func (e *edged) handlePodListFromMetaManager(content []byte, updatesChan chan<- 
 		}
 	}
 
-	klog.InfoS("handlePodListFromMetaManager, Received pod list from MetaManager before kubelet SET",
+	klog.InfoS("Received pod list from MetaManager before kubelet SET",
 		"node", e.nodeName,
 		"databasePodCount", len(lists),
 		"setPodCount", len(pods),

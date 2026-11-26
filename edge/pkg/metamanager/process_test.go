@@ -273,7 +273,9 @@ func TestProcessQueryFromAppsd(t *testing.T) {
 	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: modules.AppsdModuleName, ModuleType: common.MsgCtxTypeChannel})
 	beehiveContext.AddModule(&common.ModuleInfo{ModuleName: ModuleNameEdgeHub, ModuleType: common.MsgCtxTypeChannel})
 	beehiveContext.AddModuleGroup(ModuleNameEdgeHub, modules.HubGroup)
+	previousConnected := connect.IsConnected()
 	connect.SetConnected(true)
+	defer connect.SetConnected(previousConnected)
 
 	for _, test := range []struct {
 		name       string
@@ -1113,6 +1115,7 @@ func TestProcessDelete(t *testing.T) {
 func TestPodCleanupDB(t *testing.T) {
 	for _, test := range []struct {
 		name          string
+		source        string
 		body          interface{}
 		stored        string
 		queryError    bool
@@ -1121,7 +1124,8 @@ func TestPodCleanupDB(t *testing.T) {
 		deleteFailure int
 		wantError     bool
 	}{
-		{name: "missing UID", body: &v1.Pod{}, wantError: true},
+		{name: "missing UID from local cleanup", source: modules.MetaManagerModuleName, body: &v1.Pod{}, wantError: true},
+		{name: "legacy cloud delete without UID", body: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default"}}, stored: `{"metadata":{"uid":"old"}}`},
 		{name: "bad content", body: "{", wantError: true},
 		{name: "marshal error", body: make(chan int), wantError: true},
 		{name: "query failure", queryError: true, wantError: true},
@@ -1178,7 +1182,11 @@ func TestPodCleanupDB(t *testing.T) {
 			if body == nil {
 				body = &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "default", UID: "old"}}
 			}
-			message := model.NewMessage("").BuildRouter(ModuleNameController, modules.MetaGroup, "default/pod/pod", model.DeleteOperation).FillBody(body)
+			source := test.source
+			if source == "" {
+				source = ModuleNameController
+			}
+			message := model.NewMessage("").BuildRouter(source, modules.MetaGroup, "default/pod/pod", model.DeleteOperation).FillBody(body)
 			err := processDeletePodDB(*message)
 			if (err != nil) != test.wantError {
 				t.Fatalf("err=%v", err)
@@ -1221,7 +1229,9 @@ func TestProcessDeleteUIDMismatchIsIdempotent(t *testing.T) {
 }
 
 func TestProcessPodPatchResponse(t *testing.T) {
+	previousConnected := connect.IsConnected()
 	connect.SetConnected(true)
+	defer connect.SetConnected(previousConnected)
 	manager := newMetaManager(true)
 	for _, name := range []string{ModuleNameEdgeHub, ModuleNameEdged, manager.Name()} {
 		name := name
@@ -1723,8 +1733,75 @@ func TestProcessDeletePodLocalCleanupDeliversToListThenWatchClient(t *testing.T)
 		if !ok || object.GetUID() != "old" {
 			t.Fatalf("unexpected deleted object: %#v", event.Object)
 		}
+		if imitator.DefaultV2Client.GetRevision() <= 201 {
+			t.Fatalf("imitator revision = %d, want > 201", imitator.DefaultV2Client.GetRevision())
+		}
 	case <-time.After(time.Second):
 		t.Fatal("list-then-watch client missed local cleanup Deleted event")
+	}
+}
+
+func TestProcessDeletePodWithoutV2RecordLocalCleanupAdvancesRevisionAndDeliversWatch(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	previousDB := dbm.DBAccess
+	defer func() { dbm.DBAccess = previousDB }()
+	previousRev := imitator.DefaultV2Client.GetRevision()
+	defer imitator.DefaultV2Client.SetRevision(previousRev)
+
+	imitator.DefaultV2Client.SetRevision(uint64(200))
+	ormer := beego.NewMockOrmer(mockCtrl)
+	query := beego.NewMockQuerySeter(mockCtrl)
+	dbm.DBAccess = ormer
+	ormer.EXPECT().QueryTable(gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(query).AnyTimes()
+	query.EXPECT().All(gomock.Any()).DoAndReturn(func(target interface{}, _ ...string) (int64, error) {
+		switch result := target.(type) {
+		case *[]dao.Meta:
+			*result = nil
+		case *[]v2.MetaV2:
+			*result = nil
+		}
+		return 0, nil
+	}).AnyTimes()
+	query.EXPECT().Delete().Return(int64(1), nil).Times(4)
+
+	events := make(chan watch.Event, 2)
+	hook, err := watchhook.NewWatchHook("/core/v1/pods/default", 201, watchhook.NewChanReceiver(events))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hook.Stop()
+
+	for _, pod := range []*v1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod-1", Namespace: "default", UID: "uid-1"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod-2", Namespace: "default", UID: "uid-2"}},
+	} {
+		msg := model.NewMessage("").BuildRouter(modules.MetaManagerModuleName, modules.MetaGroup,
+			"default/pod/"+pod.Name, model.DeleteOperation).FillBody(pod)
+		if err := processDeletePodDB(*msg); err != nil {
+			t.Fatalf("processDeletePodDB(%s): %v", pod.Name, err)
+		}
+	}
+
+	var rvs []string
+	for i := 0; i < 2; i++ {
+		select {
+		case event := <-events:
+			obj, ok := event.Object.(*unstructured.Unstructured)
+			if !ok || event.Type != watch.Deleted {
+				t.Fatalf("unexpected watch event: %#v", event)
+			}
+			rvs = append(rvs, obj.GetResourceVersion())
+		case <-time.After(time.Second):
+			t.Fatalf("missing fallback deleted watch event %d", i+1)
+		}
+	}
+	if rvs[0] == "" || rvs[1] == "" || rvs[0] == rvs[1] {
+		t.Fatalf("expected distinct synthesized RVs across consecutive local cleanups, got %v", rvs)
+	}
+	if imitator.DefaultV2Client.GetRevision() <= 202 {
+		t.Fatalf("imitator revision = %d, want > 202 after two cleanups", imitator.DefaultV2Client.GetRevision())
 	}
 }
 
